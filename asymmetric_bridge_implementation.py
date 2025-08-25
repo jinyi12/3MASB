@@ -26,6 +26,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 from tqdm import trange
 import numpy as np
 import traceback
@@ -732,103 +733,182 @@ def visualize_data(xs: Tensor, title: str = "Trajectories"):
     return fig
 
 
-def visualize_bridge_results(bridge: GaussianBridge, n_viz_particles: int = 6):
+def visualize_bridge_results(bridge: GaussianBridge, n_viz_particles: int = 6, n_sde_steps: int = 100):
     """
-    Visualize the trained bridge results.
+    Generate a comprehensive visualization of the trained bridge results,
+    including dynamics, trajectories, and interpolated distributions.
     
     Args:
-        bridge: Trained GaussianBridge
-        n_viz_particles: Number of trajectories to visualize
+        bridge: Trained GaussianBridge model.
+        n_viz_particles: Number of trajectories to visualize for ODE/SDE.
+        n_sde_steps: Number of steps for SDE simulation.
     """
     bridge.eval()
+    device = next(bridge.parameters()).device
     
     with torch.no_grad():
-        # 1. Show the constraint points
+        # ================================================================
+        # 1. Core Bridge Parameters Visualization
+        # ================================================================
+        print("\n--- Visualizing Core Bridge Parameters ---")
+
         phi_ti = bridge.phi_ti.cpu()
         time_steps = bridge.time_steps.cpu()
         
-        print("Constraint Points:")
-        for i, (t, phi) in enumerate(zip(time_steps, phi_ti)):
-            print(f"  t_{i} = {t:.2f}: {phi.numpy()}")
-        
-        # 2. Visualize the mean trajectory
-        fine_times = torch.linspace(0, bridge.T, 100)
+        fine_times = torch.linspace(0, bridge.T, 200)
         mu_traj, _ = bridge.mu_spline(fine_times)
         gamma_traj, _ = bridge.gamma_spline(fine_times)
         
-        fig1 = plt.figure(figsize=(15, 5))
+        fig1 = plt.figure(figsize=(18, 6))
+        fig1.suptitle("Figure 1: Optimized Bridge Parameters", fontsize=16)
         
         # Mean trajectory
         ax1 = fig1.add_subplot(131, projection='3d')
-        ax1.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'b-', linewidth=2, label='Mean trajectory')
-        ax1.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=100, label='Constraints')
-        ax1.set_title('Optimized Mean Trajectory μ(t)')
+        ax1.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'b-', linewidth=2.5, label='Mean Trajectory μ(t)')
+        ax1.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints φ(t_i)')
+        ax1.set_title('A) Optimized Mean Trajectory')
+        ax1.set_xlabel('z₁'); ax1.set_ylabel('z₂'); ax1.set_zlabel('z₃')
         ax1.legend()
-        
+
         # Variance evolution
         ax2 = fig1.add_subplot(132)
-        ax2.plot(fine_times, gamma_traj.squeeze(), 'g-', linewidth=2)
-        ax2.scatter(time_steps, torch.zeros_like(time_steps), c='red', s=50)
-        ax2.set_xlabel('Time t')
-        ax2.set_ylabel('γ(t)')
-        ax2.set_title('Standard Deviation Evolution')
-        ax2.grid(True)
+        ax2.plot(fine_times, gamma_traj.squeeze(), 'g-', linewidth=2.5)
+        ax2.scatter(time_steps, torch.zeros_like(time_steps), c='red', s=80, edgecolors='k')
+        ax2.set_title('B) Standard Deviation γ(t)')
+        ax2.set_xlabel('Time t'); ax2.set_ylabel('γ(t)')
+        ax2.grid(True, linestyle='--')
+        ax2.set_ylim(bottom=0)
+
+        # Path regularization (kinetic energy) over time
+        ax3 = fig1.add_subplot(133)
+        times_for_reg = torch.linspace(0.01, bridge.T - 0.01, 100)
+        regularization_vals = []
+        for t in times_for_reg:
+            _, dmu_dt, _, dgamma_dt = bridge.get_params(t.unsqueeze(0).to(device))
+            reg_val = (torch.sum(dmu_dt**2) + dgamma_dt**2 * bridge.data_dim) / 2
+            regularization_vals.append(reg_val.item())
         
-        # Path regularization over time
-        ax3 = fig1.add_subplot(133) 
-        with torch.enable_grad():
-            bridge.train()
-            times_for_reg = torch.linspace(0.01, bridge.T-0.01, 50).requires_grad_(False)
-            regularization_vals = []
-            
-            for t in times_for_reg:
-                _, dmu_dt, _, dgamma_dt = bridge.get_params(t.unsqueeze(0))
-                reg_val = (torch.sum(dmu_dt**2) + dgamma_dt**2 * bridge.data_dim) / 2
-                regularization_vals.append(reg_val.item())
+        ax3.plot(times_for_reg.cpu(), regularization_vals, 'purple', linewidth=2.5)
+        ax3.set_title('C) Path Kinetic Energy ½E[||v||²]')
+        ax3.set_xlabel('Time t'); ax3.set_ylabel('Kinetic Energy')
+        ax3.grid(True, linestyle='--')
         
-        ax3.plot(times_for_reg, regularization_vals, 'purple', linewidth=2)
-        ax3.set_xlabel('Time t')
-        ax3.set_ylabel('Kinetic Energy')
-        ax3.set_title('Path Regularization ½||v||²')
-        ax3.grid(True)
-        
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
         plt.show()
-        
-        bridge.eval()
-        
-        # 3. Simulate some forward trajectories (deterministic ODE)
-        print("\nSimulating forward trajectories...")
-        
-        # Start from slightly perturbed initial conditions
+
+        # ================================================================
+        # 2. Asymmetric Dynamics Visualization (Forward ODE vs. Reverse SDE)
+        # ================================================================
+        print("\n--- Visualizing Asymmetric Trajectories (Forward ODE and Reverse SDE) ---")
+
+        # Forward ODE Simulation
+        print("Simulating forward deterministic trajectories (ODE)...")
         z0_base = phi_ti[0].unsqueeze(0).repeat(n_viz_particles, 1)
-        z0_perturbed = z0_base + 0.1 * torch.randn_like(z0_base)
+        z0_perturbed = z0_base + 0.05 * torch.randn_like(z0_base)
         
-        # Simple forward Euler integration for ODE
-        n_steps = 200
-        dt = bridge.T / n_steps
-        times = torch.linspace(0, bridge.T, n_steps + 1)
+        n_ode_steps = 200
+        dt_ode = bridge.T / n_ode_steps
+        times_ode = torch.linspace(0, bridge.T, n_ode_steps + 1)
         
         forward_trajectories = []
         for i in range(n_viz_particles):
-            traj = [z0_perturbed[i]]
-            z = z0_perturbed[i]
-            
-            for step, t in enumerate(times[:-1]):
-                v = bridge.forward_velocity(z.unsqueeze(0), torch.tensor([t]))[0]
-                z = z + v * dt
-                traj.append(z)
-            
+            traj = [z0_perturbed[i].clone()]
+            z = z0_perturbed[i].clone().to(device)
+            for t in times_ode[:-1]:
+                v = bridge.forward_velocity(z.unsqueeze(0), t.to(device).unsqueeze(0))[0]
+                z = z + v * dt_ode
+                traj.append(z.cpu())
             forward_trajectories.append(torch.stack(traj))
-        
         forward_trajectories = torch.stack(forward_trajectories)
+
+        # Reverse SDE Simulation
+        print("Simulating reverse stochastic trajectories (SDE)...")
+        t_start_tensor = torch.tensor([bridge.T], device=device)
+        mu_start, _, gamma_start, _ = bridge.get_params(t_start_tensor)
+        zT = mu_start + gamma_start * torch.randn(n_viz_particles, bridge.data_dim, device=device)
         
-        # Visualize forward trajectories
-        visualize_data(forward_trajectories, "Forward Deterministic Trajectories (ODE)")
+        reverse_trajectories = solve_gaussian_bridge_reverse_sde(
+            bridge=bridge, z_start=zT, ts=bridge.T, tf=0.0, n_steps=n_sde_steps
+        ).cpu()
+        # Transpose to [n_particles, n_steps, dim]
+        reverse_trajectories = reverse_trajectories.permute(1, 0, 2)
+
+        # Plotting both dynamics
+        fig2 = plt.figure(figsize=(16, 8))
+        fig2.suptitle("Figure 2: Asymmetric Dynamics", fontsize=16)
+
+        # Forward ODE plot
+        ax_fwd = fig2.add_subplot(121, projection='3d')
+        for i in range(n_viz_particles):
+            ax_fwd.plot(forward_trajectories[i, :, 0], forward_trajectories[i, :, 1], forward_trajectories[i, :, 2], alpha=0.8)
+        ax_fwd.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'k--', linewidth=2, label='Mean Trajectory')
+        ax_fwd.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints')
+        ax_fwd.set_title('A) Forward Deterministic Trajectories (ODE)')
+        ax_fwd.set_xlabel('z₁'); ax_fwd.set_ylabel('z₂'); ax_fwd.set_zlabel('z₃')
+        ax_fwd.legend()
+
+        # Reverse SDE plot
+        ax_rev = fig2.add_subplot(122, projection='3d')
+        for i in range(n_viz_particles):
+            ax_rev.plot(reverse_trajectories[i, :, 0], reverse_trajectories[i, :, 1], reverse_trajectories[i, :, 2], alpha=0.8)
+        ax_rev.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'k--', linewidth=2, label='Mean Trajectory')
+        ax_rev.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints')
+        ax_rev.set_title('B) Reverse Stochastic Trajectories (SDE)')
+        ax_rev.set_xlabel('z₁'); ax_rev.set_ylabel('z₂'); ax_rev.set_zlabel('z₃')
+        ax_rev.legend()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+        # ================================================================
+        # 3. Interpolated Marginal Distributions Visualization
+        # ================================================================
+        print("\n--- Visualizing Interpolated Marginal Distributions p(z,t) ---")
+
+        n_dist_times = 5
+        viz_times = torch.linspace(0.05 * bridge.T, 0.95 * bridge.T, n_dist_times)
+        n_samples_dist = 200
+
+        fig3, axes = plt.subplots(1, n_dist_times, figsize=(n_dist_times * 4, 4.5), sharex=True, sharey=True)
+        fig3.suptitle("Figure 3: Interpolated Marginal Distributions p(z,t) (z₁-z₂ projection)", fontsize=16)
+
+        for i, t_viz in enumerate(viz_times):
+            ax = axes[i]
+            mu_viz, _, gamma_viz, _ = bridge.get_params(t_viz.unsqueeze(0).to(device))
+            mu_viz = mu_viz.cpu().squeeze(0)
+            gamma_viz = gamma_viz.cpu().item()
+
+            # Draw samples from the distribution
+            samples = mu_viz + gamma_viz * torch.randn(n_samples_dist, bridge.data_dim)
+
+            ax.scatter(samples[:, 0], samples[:, 1], alpha=0.3, label='Samples' if i==0 else "")
+            ax.scatter(mu_viz[0], mu_viz[1], c='red', s=80, edgecolors='k', label='Mean μ(t)' if i==0 else "")
+
+            # Draw covariance ellipse (2 standard deviations)
+            ellipse = Ellipse(
+                xy=(mu_viz[0], mu_viz[1]),
+                width=2 * gamma_viz * 2, # 2*std_dev in x
+                height=2 * gamma_viz * 2, # 2*std_dev in y
+                edgecolor='g',
+                facecolor='none',
+                linewidth=2.5,
+                linestyle='--',
+                label='2σ Covariance' if i==0 else ""
+            )
+            ax.add_patch(ellipse)
+
+            ax.set_title(f"t = {t_viz.item():.2f}")
+            ax.set_xlabel('z₁');
+            if i == 0:
+                ax.set_ylabel('z₂')
+            ax.grid(True, linestyle='--')
+            ax.set_aspect('equal', adjustable='box')
+
+        fig3.legend(loc='upper right', bbox_to_anchor=(1.0, 0.9))
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.show()
         
-        print(f"\nForward trajectories shape: {forward_trajectories.shape}")
-        print("Forward simulation complete!")
+        print("\nVisualization complete!")
 
 
 if __name__ == "__main__":
@@ -869,7 +949,7 @@ if __name__ == "__main__":
     
     # Step 4: Visualize results
     print("\n4. Visualizing results...")
-    visualize_bridge_results(bridge, n_viz_particles=6)
+    visualize_bridge_results(bridge, n_viz_particles=6, n_sde_steps=100)
     
     # Step 5: Rigorous validation
     print("\n5. Performing rigorous asymmetric consistency validation...")
