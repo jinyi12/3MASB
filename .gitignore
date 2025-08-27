@@ -1,2 +1,13 @@
 .vscode
 __pycache__
+# all recursive image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+# ignore specific files
+sde_matching_from_scratch.ipynb
+multiscalemodeling_bridge_preliminary_plan.md
