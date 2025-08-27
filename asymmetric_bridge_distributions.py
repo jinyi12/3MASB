@@ -23,6 +23,7 @@ from torch import nn, Tensor
 from torch import distributions as D
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
+from matplotlib import transforms
 from tqdm import trange
 import numpy as np
 import traceback
@@ -553,6 +554,163 @@ def validate_asymmetric_consistency(
     return results
 
 
+def plot_confidence_ellipse(ax, mu, cov, n_std=2.0, **kwargs):
+    """
+    Plots a confidence ellipse for a 2D Gaussian distribution.
+    Projects a 3D covariance to 2D if necessary.
+    """
+    if mu.shape[0] > 2:
+        mu_2d = mu[:2]
+    else:
+        mu_2d = mu
+
+    if cov.shape[0] > 2:
+        cov_2d = cov[:2, :2]
+    else:
+        cov_2d = cov
+
+    if cov_2d.shape != (2, 2):
+        raise ValueError("Covariance matrix must be 2x2 for ellipse plot.")
+
+    lambda_, v = np.linalg.eigh(cov_2d)
+    # Eigh can return negative eigenvalues for near-singular matrices. Clamp to 0.
+    lambda_ = np.sqrt(np.maximum(lambda_, 0))
+
+    angle = np.rad2deg(np.arctan2(*v[:, 0][::-1]))
+
+    ell = Ellipse(xy=(mu_2d[0], mu_2d[1]),
+                  width=lambda_[0]*n_std*2, height=lambda_[1]*n_std*2,
+                  angle=angle, **kwargs)
+    ell.set_facecolor('none')
+    ax.add_patch(ell)
+
+
+def _plot_marginal_distribution_comparison(
+    bridge, T, n_viz_particles, n_sde_steps, output_dir, device
+):
+    print("  - Plotting marginal distribution comparisons...")
+
+    # Define validation times
+    validation_times = [T * f for f in [0.25, 0.5, 0.75]]
+
+    # --- Forward ODE Simulation ---
+    t0_tensor = torch.tensor([[0.0]], device=device, dtype=torch.float32)
+    mu0, gamma0 = bridge.get_params(t0_tensor)
+    z0 = mu0 + gamma0 * torch.randn(n_viz_particles, bridge.data_dim, device=device)
+
+    def forward_ode_func(t, z_np):
+        B = z_np.shape[0] // bridge.data_dim
+        z = torch.from_numpy(z_np).float().to(device).reshape(B, bridge.data_dim)
+        t_tensor = torch.tensor([[t]], device=device, dtype=torch.float32)
+        with torch.no_grad():
+            v = bridge.forward_velocity(z, t_tensor)
+        return v.cpu().numpy().flatten()
+
+    times_eval = torch.linspace(0, T, n_sde_steps + 1).numpy()
+    z0_np = z0.cpu().numpy().flatten()
+    sol = solve_ivp(
+        fun=forward_ode_func, t_span=[0, T], y0=z0_np, method='RK45', t_eval=times_eval
+    )
+    # Reshape to [n_times, n_particles, data_dim]
+    forward_path = torch.from_numpy(sol.y.T).float().reshape(len(times_eval), n_viz_particles, bridge.data_dim)
+
+    # --- Reverse SDE Simulation ---
+    tT_tensor = torch.tensor([[T]], device=device, dtype=torch.float32)
+    muT, gammaT = bridge.get_params(tT_tensor)
+    zT = muT + gammaT * torch.randn(n_viz_particles, bridge.data_dim, device=device)
+
+    reverse_path = solve_gaussian_bridge_reverse_sde(
+        bridge=bridge, z_start=zT, ts=T, tf=0.0, n_steps=n_sde_steps
+    ).cpu() # Shape [n_steps+1, n_particles, dim]
+
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, len(validation_times), figsize=(6 * len(validation_times), 6), sharex=True, sharey=True)
+    fig.suptitle("Figure 3: Comparison of Marginal Distributions p_t(z)", fontsize=16)
+
+    for i, t_val in enumerate(validation_times):
+        ax = axes[i]
+
+        # Find closest time index
+        forward_idx = np.argmin(np.abs(times_eval - t_val))
+        reverse_times = np.linspace(T, 0, n_sde_steps + 1)
+        reverse_idx = np.argmin(np.abs(reverse_times - t_val))
+
+        # Get particles
+        fwd_particles = forward_path[forward_idx].cpu().numpy()
+        rev_particles = reverse_path[reverse_idx].cpu().numpy()
+
+        # Get analytical distribution
+        t_tensor = torch.tensor([[t_val]], device=device)
+        mu_gt, gamma_gt = bridge.get_params(t_tensor)
+        mu_gt = mu_gt[0].cpu().numpy()
+        cov_gt = torch.diag(gamma_gt[0].cpu().numpy()**2)
+
+        # Plot (projected on z1-z2 plane)
+        ax.scatter(fwd_particles[:, 0], fwd_particles[:, 1], alpha=0.3, label='Fwd ODE', color='blue', s=10)
+        ax.scatter(rev_particles[:, 0], rev_particles[:, 1], alpha=0.3, label='Rev SDE', color='green', s=10)
+
+        # Plot analytical mean and covariance ellipse
+        ax.scatter(mu_gt[0], mu_gt[1], marker='x', color='red', s=100, label='Learned Mean')
+        plot_confidence_ellipse(ax, mu_gt, cov_gt, n_std=2.0, edgecolor='red', linewidth=2, linestyle='--')
+
+        ax.set_title(f't = {t_val:.2f}')
+        ax.set_xlabel('z₁')
+        if i == 0:
+            ax.set_ylabel('z₂')
+        ax.grid(True, linestyle='--')
+        ax.legend()
+        ax.set_aspect('equal', adjustable='box')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "fig3_marginal_comparison.png"), dpi=300)
+    plt.close()
+
+
+def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
+    print("  - Plotting marginal data fit...")
+
+    # --- Plotting ---
+    # Determine the number of marginal constraints
+    n_marginals = len(marginal_data)
+    # Sort the times for consistent plotting order
+    sorted_times = sorted(marginal_data.keys())
+
+    fig, axes = plt.subplots(1, n_marginals, figsize=(6 * n_marginals, 6), sharex=True, sharey=True)
+    if n_marginals == 1: # If only one subplot, axes is not a list
+        axes = [axes]
+
+    fig.suptitle("Figure 4: Qualitative Fit to Marginal Data Constraints", fontsize=16)
+
+    for i, t_k in enumerate(sorted_times):
+        ax = axes[i]
+        samples_k = marginal_data[t_k].cpu().numpy()
+
+        # Get analytical distribution at time t_k
+        t_k_tensor = torch.tensor([[t_k]], device=device)
+        mu_k, gamma_k = bridge.get_params(t_k_tensor)
+        mu_k = mu_k[0].cpu().numpy()
+        cov_k = torch.diag(gamma_k[0].cpu().numpy()**2)
+
+        # Plot the data samples (projected on z1-z2 plane)
+        ax.scatter(samples_k[:, 0], samples_k[:, 1], alpha=0.5, label='Data Samples', s=15, color='gray')
+
+        # Plot the learned distribution's mean and covariance ellipse
+        ax.scatter(mu_k[0], mu_k[1], marker='P', color='orange', s=150, label='Learned Mean', edgecolors='black')
+        plot_confidence_ellipse(ax, mu_k, cov_k, n_std=2.0, edgecolor='orange', linewidth=2.5, linestyle='-')
+
+        ax.set_title(f't = {t_k:.2f}')
+        ax.set_xlabel('z₁')
+        if i == 0:
+            ax.set_ylabel('z₂')
+        ax.grid(True, linestyle='--')
+        ax.legend()
+        ax.set_aspect('equal', adjustable='box')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "fig4_marginal_fit.png"), dpi=300)
+    plt.close()
+
+
 def _plot_data_and_trajectory(bridge, marginal_data, T, output_dir, device):
     print("  - Plotting data and mean trajectory...")
     
@@ -716,6 +874,9 @@ def visualize_bridge_results(bridge: NeuralGaussianBridge, marginal_data: Dict[f
     with torch.no_grad():
         _plot_data_and_trajectory(bridge, marginal_data_cpu, T, output_dir, device)
         _plot_asymmetric_dynamics(bridge, T, n_viz_particles, n_sde_steps, output_dir, device)
+        _plot_marginal_distribution_comparison(bridge, T, n_viz_particles, n_sde_steps, output_dir, device)
+        _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device)
+
 
     print(f"Visualizations saved to '{output_dir}' directory.")
 
