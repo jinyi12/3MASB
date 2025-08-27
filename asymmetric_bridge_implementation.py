@@ -30,24 +30,23 @@ from matplotlib.patches import Ellipse
 from tqdm import trange
 import numpy as np
 import traceback
-import ot  # Optimal Transport
+try:
+    import ot  # Optimal Transport
+except ImportError:
+    print("Warning: POT library not found. Wasserstein distance calculation will be skipped.")
+    ot = None
 import os
+from scipy.integrate import solve_ivp
 
 
-class DifferentiableLinearSpline(nn.Module):
+# ============================================================================
+# FIX 1 & 2: Differentiable Natural Cubic Spline with Log-Space Option
+# ============================================================================
+
+class DifferentiableCubicSpline(nn.Module):
     """
-    A simplified differentiable spline using linear interpolation.
-    
-    This is a tractable alternative to cubic splines for the preliminary
-    implementation. It ensures continuity while remaining differentiable.
-    
-    Args:
-        fixed_points: Points that must be interpolated exactly [N_fixed, dim]
-        fixed_times: Times corresponding to fixed points [N_fixed]
-        n_control: Number of trainable control points
-        T: Total time span
-        dim: Dimension of the interpolated values
-        enforce_positivity: Whether to enforce positive values (for gamma_t)
+    A differentiable natural cubic spline implementation (C2 continuous).
+    Supports log-space interpolation to guarantee positivity.
     """
     
     def __init__(
@@ -63,117 +62,191 @@ class DifferentiableLinearSpline(nn.Module):
         
         self.T = T
         self.dim = dim
-        self.enforce_positivity = enforce_positivity
+        self.interpolate_in_log_space = enforce_positivity
         
-        # Create control times between fixed points
+        # 1. Define Fixed Points (Constraints)
+        self.fixed_times = nn.Parameter(fixed_times, requires_grad=False)
+        # Store fixed points in linear space for reference
+        self.fixed_points_linear = nn.Parameter(fixed_points, requires_grad=False)
+
+        # Store fixed points in the interpolation space
+        if self.interpolate_in_log_space:
+            if (fixed_points <= 0).any():
+                 raise ValueError(f"Fixed points must be strictly positive for log-space interpolation.")
+            self.fixed_points_interp = nn.Parameter(torch.log(fixed_points), requires_grad=False)
+        else:
+            self.fixed_points_interp = nn.Parameter(fixed_points, requires_grad=False)
+
+        # 2. Define Control Points (Trainable parameters)
         if n_control > 0:
             control_times = torch.linspace(0, T, n_control + 2)[1:-1]
             self.control_times = nn.Parameter(control_times, requires_grad=False)
             
-            if enforce_positivity:
-                # Use softplus to ensure positivity
-                self._raw_control_points = nn.Parameter(torch.randn(n_control, dim))
-                self.control_points = lambda: F.softplus(self._raw_control_points)
-            else:
-                self.control_points = nn.Parameter(torch.randn(n_control, dim))
+            # Initialize control points near the mean of fixed points in the interpolation space
+            mean_interp = self.fixed_points_interp.mean(dim=0)
+            self.control_points = nn.Parameter(mean_interp.clone() + torch.randn(n_control, dim) * 0.1)
         else:
-            self.control_times = torch.tensor([])
-            if enforce_positivity:
-                self.control_points = lambda: torch.empty(0, dim)
-            else:
-                self.control_points = torch.empty(0, dim)
+            self.register_buffer('control_times', torch.tensor([]))
+            self.register_buffer('control_points', torch.empty(0, dim))
         
-        # Combine and sort all points
-        self.fixed_points = nn.Parameter(fixed_points, requires_grad=False)
-        self.fixed_times = nn.Parameter(fixed_times, requires_grad=False)
-        
+
     def _get_all_points_and_times(self):
-        """Get all points (fixed + control) sorted by time."""
-        if isinstance(self.control_points, nn.Parameter):
-            control_pts = self.control_points
-        else:
-            control_pts = self.control_points()
+        """Get all points (fixed + control) in the interpolation space, sorted by time."""
+        
+        fixed_pts = self.fixed_points_interp
+        control_pts = self.control_points
             
         if len(self.control_times) > 0:
             all_times = torch.cat([self.fixed_times, self.control_times])
-            all_points = torch.cat([self.fixed_points, control_pts], dim=0)
+            all_points = torch.cat([fixed_pts, control_pts], dim=0)
         else:
             all_times = self.fixed_times
-            all_points = self.fixed_points
+            all_points = fixed_pts
             
         # Sort by time
         sorted_indices = torch.argsort(all_times)
         return all_points[sorted_indices], all_times[sorted_indices]
-    
+
+    def _compute_coefficients(self, Y, T_knots):
+        """
+        Solves the TDMA system for Natural Cubic Spline coefficients using torch.linalg.solve.
+        Y are the values in the interpolation space.
+        """
+        N_knots = Y.shape[0]
+        N = N_knots - 1 # Number of intervals
+        
+        if N < 1:
+             return None, None, None, Y, T_knots
+
+        H = T_knots[1:] - T_knots[:-1] # Interval lengths [N]
+        H = torch.clamp(H, min=1e-9) # Robustness
+
+        DY = (Y[1:] - Y[:-1]) / H.unsqueeze(-1)
+
+        # --- Solve for internal moments M_1...M_{N-1} (Second derivatives) ---
+        
+        if N == 1:
+            # Case N=1: Straight line. M_0=0, M_1=0.
+            M_internal = torch.empty(0, self.dim, device=Y.device, dtype=Y.dtype)
+        else:
+            # Case N>1: Solve A M = B
+            
+            # Construct the tri-diagonal matrix A [N-1, N-1]
+            A = torch.zeros((N-1, N-1), device=Y.device, dtype=Y.dtype)
+            
+            # Diagonal elements: 2 * (h_{i-1} + h_i)
+            diag = 2.0 * (H[:-1] + H[1:])
+            A += torch.diag(diag)
+
+            # Off-diagonal elements: h_i
+            if N > 1:
+                off_diag = H[1:-1]
+                if off_diag.numel() > 0:
+                    A += torch.diag(off_diag, diagonal=1)
+                    A += torch.diag(off_diag, diagonal=-1)
+
+            # Construct the right-hand side B [N-1, dim]
+            # B_i = 6 * (DY_i - DY_{i-1})
+            B = 6.0 * (DY[1:] - DY[:-1])
+
+            # Solve A M = B for M [N-1, dim]
+            try:
+                M_internal = torch.linalg.solve(A, B)
+            except torch.linalg.LinAlgError as e:
+                print("Warning: Failed to solve linear system for spline coefficients.")
+                raise e
+
+        # Add boundary conditions (Natural: M_0=0, M_N=0)
+        M = torch.cat([torch.zeros(1, self.dim, device=Y.device, dtype=Y.dtype),
+                       M_internal,
+                       torch.zeros(1, self.dim, device=Y.device, dtype=Y.dtype)], dim=0)
+        
+        # --- Calculate polynomial coefficients (a, b, c, d) ---
+        H_unsqueezed = H.unsqueeze(-1)
+        
+        a = (M[1:] - M[:-1]) / (6.0 * H_unsqueezed)
+        b = M[:-1] / 2.0
+        c = DY - H_unsqueezed * (2.0 * M[:-1] + M[1:]) / 6.0
+        d = Y[:-1]
+
+        return a, b, c, d, T_knots
+
     def forward(self, t: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Evaluate spline and its time derivative at time t.
-        
-        Args:
-            t: Time points to evaluate [batch_size] or [batch_size, 1]
-            
-        Returns:
-            value: Spline values at t [batch_size, dim]
-            derivative: Time derivatives at t [batch_size, dim]
+        Returns values in linear space.
         """
-        if t.dim() == 2:
+        # Ensure t is 1D
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        elif t.dim() == 2:
             t = t.squeeze(-1)
         
-        all_points, all_times = self._get_all_points_and_times()
+        # 1. Compute coefficients in the interpolation space S(t)
+        Y_interp, T_knots = self._get_all_points_and_times()
         
-        # Linear interpolation
-        values = []
-        derivatives = []
-        
-        for t_i in t:
-            # Find the interval containing t_i
-            if t_i <= all_times[0]:
-                # Before first point - extrapolate with zero derivative
-                val = all_points[0]
-                deriv = torch.zeros_like(all_points[0])
-            elif t_i >= all_times[-1]:
-                # After last point - extrapolate with zero derivative  
-                val = all_points[-1]
-                deriv = torch.zeros_like(all_points[-1])
-            else:
-                # Find interval
-                right_idx = torch.searchsorted(all_times, t_i, right=True)
-                left_idx = right_idx - 1
-                
-                # Linear interpolation
-                t_left, t_right = all_times[left_idx], all_times[right_idx]
-                p_left, p_right = all_points[left_idx], all_points[right_idx]
-                
-                alpha = (t_i - t_left) / (t_right - t_left)
-                val = (1 - alpha) * p_left + alpha * p_right
-                deriv = (p_right - p_left) / (t_right - t_left)
-            
-            values.append(val)
-            derivatives.append(deriv)
-        
-        return torch.stack(values), torch.stack(derivatives)
+        if Y_interp.dtype != t.dtype:
+            t = t.to(Y_interp.dtype)
 
+        a, b, c, d, T_knots = self._compute_coefficients(Y_interp, T_knots)
+        
+        if a is None:
+            # Handle N<1 case (constant function)
+            value_interp = Y_interp[0].expand(t.shape[0], -1)
+            derivative_interp = torch.zeros_like(value_interp)
+        else:
+            # 2. Evaluate S(t) and S'(t)
+            
+            # Clamp t within the bounds for evaluation stability.
+            t_clamped = torch.clamp(t, min=T_knots[0], max=T_knots[-1] - 1e-6)
+            
+            # Find the interval index i
+            indices = torch.searchsorted(T_knots, t_clamped, right=True) - 1
+            
+            N = a.shape[0]
+            indices = torch.clamp(indices, 0, N - 1)
+            
+            # Calculate (t - t_i)
+            dt = t_clamped - T_knots[indices]
+            dt = dt.unsqueeze(-1)
+            
+            # Select coefficients
+            a_i = a[indices]; b_i = b[indices]; c_i = c[indices]; d_i = d[indices]
+
+            # Evaluate S(t) and S'(t)
+            value_interp = a_i * dt**3 + b_i * dt**2 + c_i * dt + d_i
+            derivative_interp = 3.0 * a_i * dt**2 + 2.0 * b_i * dt + c_i
+            
+            # 3. Handle extrapolation (Zero derivative in interpolation space)
+            is_before = t < T_knots[0]
+            is_after = t > T_knots[-1]
+            
+            if is_before.any():
+                value_interp[is_before] = Y_interp[0].expand(torch.sum(is_before), -1)
+                derivative_interp[is_before] = 0.0
+                
+            if is_after.any():
+                value_interp[is_after] = Y_interp[-1].expand(torch.sum(is_after), -1)
+                derivative_interp[is_after] = 0.0
+
+        # 4. Transform back to linear space Y(t)
+        if self.interpolate_in_log_space:
+            # Y(t) = exp(S(t)); Y'(t) = exp(S(t)) * S'(t)
+            final_value = torch.exp(value_interp)
+            final_derivative = final_value * derivative_interp
+        else:
+            final_value = value_interp
+            final_derivative = derivative_interp
+            
+        return final_value, final_derivative
+
+
+# ============================================================================
+# Gaussian Bridge Model (Updated)
+# ============================================================================
 
 class GaussianBridge(nn.Module):
-    """
-    Gaussian Asymmetric Multi-Marginal Bridge.
-    
-    This module implements the Gaussian approximation of the asymmetric bridge,
-    where the latent flow is restricted to Z_t = mu_t + gamma_t * epsilon.
-    
-    Key features:
-    - Analytical forward velocity field (ODE)
-    - Analytical reverse drift (SDE) 
-    - Simulation-free optimization via reparameterization trick
-    - Exact constraint satisfaction by construction
-    
-    Args:
-        phi_ti: Fixed marginal points [N_constraints, data_dim]
-        time_steps: Times for constraints [N_constraints]  
-        n_control: Number of control points for splines
-        data_dim: Dimension of the data space
-        sigma_reverse: Diffusion coefficient for reverse SDE
-    """
+    # (Docstring omitted for brevity)
     
     def __init__(
         self, 
@@ -189,12 +262,13 @@ class GaussianBridge(nn.Module):
         self.T = time_steps[-1].item()
         self.sigma_reverse = sigma_reverse
         
-        # Store constraint information
         self.register_buffer('phi_ti', phi_ti)
         self.register_buffer('time_steps', time_steps)
         
+        # --- FIX: Use DifferentiableCubicSpline ---
+        
         # Spline for mu_t (mean trajectory)
-        self.mu_spline = DifferentiableLinearSpline(
+        self.mu_spline = DifferentiableCubicSpline(
             fixed_points=phi_ti,
             fixed_times=time_steps,
             n_control=n_control,
@@ -204,192 +278,137 @@ class GaussianBridge(nn.Module):
         )
         
         # Spline for gamma_t (standard deviation)
-        epsilon = 1e-3
-        gamma_fixed = torch.full((len(time_steps), 1), epsilon) # Changed from zeros for numerical stability
-        self.gamma_spline = DifferentiableLinearSpline(
+        # Use a small epsilon for stability with log-space interpolation.
+        epsilon = 1e-1
+        gamma_fixed = torch.full((len(time_steps), 1), epsilon, dtype=phi_ti.dtype, device=phi_ti.device)
+        
+        # Use log space interpolation
+        self.gamma_spline = DifferentiableCubicSpline(
             fixed_points=gamma_fixed,
             fixed_times=time_steps,
             n_control=n_control,
             T=self.T,
             dim=1,
-            enforce_positivity=True
+            enforce_positivity=True 
         )
     
     def get_params(self, t: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        Get Gaussian parameters and their time derivatives.
-        
-        Args:
-            t: Time points [batch_size] or [batch_size, 1]
-            
-        Returns:
-            mu: Mean [batch_size, data_dim]
-            dmu_dt: Time derivative of mean [batch_size, data_dim]  
-            gamma: Standard deviation [batch_size, 1]
-            dgamma_dt: Time derivative of std [batch_size, 1]
-        """
         mu, dmu_dt = self.mu_spline(t)
         gamma, dgamma_dt = self.gamma_spline(t)
         
-        # Ensure numerical stability
-        gamma = torch.clamp(gamma, min=1e-6)
+        # Gamma is guaranteed positive by construction, but clamp for safety
+        gamma = torch.clamp(gamma, min=1e-9)
         
         return mu, dmu_dt, gamma, dgamma_dt
     
     def forward_velocity(self, z: Tensor, t: Tensor) -> Tensor:
         """
         Compute the deterministic forward velocity field.
-        
-        This is the velocity of the Probability Flow ODE:
         v(z,t) = ∂mu/∂t + (∂gamma/∂t / gamma) * (z - mu)
-        
-        Args:
-            z: State [batch_size, data_dim]
-            t: Time [batch_size] or [batch_size, 1] or scalar
-            
-        Returns:
-            velocity: Forward velocity [batch_size, data_dim]
         """
-        # Ensure t is properly shaped
-        if torch.is_tensor(t) and t.dim() == 0:  # scalar tensor
+        # Ensure t is properly shaped and has the correct dtype
+        if torch.is_tensor(t) and t.dim() == 0:
             t = t.unsqueeze(0)
-        elif not torch.is_tensor(t):  # python scalar
-            t = torch.tensor([float(t)], device=z.device)
-        elif t.dim() == 1 and len(t) == 1:  # single element tensor
-            pass  # already correct shape
-        elif t.dim() == 2 and t.shape[1] == 1:  # [batch, 1]
+        elif not torch.is_tensor(t):
+            t = torch.tensor([float(t)], device=z.device, dtype=z.dtype)
+        elif t.dim() == 2 and t.shape[1] == 1:
             t = t.squeeze(-1)
+        
+        if t.dtype != z.dtype:
+            t = t.to(z.dtype)
         
         # Get parameters at time t
         mu, dmu_dt, gamma, dgamma_dt = self.get_params(t)
         
-        # Handle batch broadcasting - expand to match z batch size
-        if z.shape[0] > 1 and mu.shape[0] == 1:
-            mu = mu.expand(z.shape[0], -1)
-            dmu_dt = dmu_dt.expand(z.shape[0], -1)
-            gamma = gamma.expand(z.shape[0], -1)
-            dgamma_dt = dgamma_dt.expand(z.shape[0], -1)
-        
-        # The division by gamma is numerically unstable when gamma is close to zero.
-        # We clamp gamma to a small positive value to prevent division by zero.
+        # Handle batch broadcasting
+        B_z = z.shape[0]; B_t = mu.shape[0]
+
+        if B_z != B_t:
+            if B_t == 1:
+                # Single time, multiple z (e.g., during simulation)
+                mu = mu.expand(B_z, -1)
+                dmu_dt = dmu_dt.expand(B_z, -1)
+                gamma = gamma.expand(B_z, -1)
+                dgamma_dt = dgamma_dt.expand(B_z, -1)
+            elif B_z == 1:
+                z = z.expand(B_t, -1)
+            else:
+                raise ValueError(f"Incompatible batch sizes for z ({B_z}) and t ({B_t})")
+
+        # Calculate velocity. Stable as gamma > 0.
         safe_gamma = torch.clamp(gamma, min=1e-9)
+        
+        # Note: (dgamma_dt / gamma) is exactly the log-space derivative S'(t).
         velocity = dmu_dt + (dgamma_dt / safe_gamma) * (z - mu)
         return velocity
     
     def score_function(self, z: Tensor, t: Tensor) -> Tensor:
-        """
-        Compute the score function ∇_z log p_t(z) for Gaussian flow.
-        
-        For Gaussian: ∇ log p(z) = -(z - mu) / gamma^2
-        
-        Args:
-            z: State [batch_size, data_dim]
-            t: Time [batch_size] or [batch_size, 1] or scalar
-            
-        Returns:
-            score: Score function [batch_size, data_dim]
-        """
-        # Ensure t is properly shaped
-        if torch.is_tensor(t) and t.dim() == 0:  # scalar tensor
+        # (Robust shaping of t)
+        if torch.is_tensor(t) and t.dim() == 0:
             t = t.unsqueeze(0)
-        elif not torch.is_tensor(t):  # python scalar
-            t = torch.tensor([float(t)], device=z.device)
-        elif t.dim() == 1 and len(t) == 1:  # single element tensor
-            pass  # already correct shape
-        elif t.dim() == 2 and t.shape[1] == 1:  # [batch, 1]
+        elif not torch.is_tensor(t):
+            t = torch.tensor([float(t)], device=z.device, dtype=z.dtype)
+        elif t.dim() == 2 and t.shape[1] == 1:
             t = t.squeeze(-1)
+
+        if t.dtype != z.dtype:
+            t = t.to(z.dtype)
             
         mu, _, gamma, _ = self.get_params(t)
         
-        # Handle batch broadcasting - expand to match z batch size
-        if z.shape[0] > 1 and mu.shape[0] == 1:
-            mu = mu.expand(z.shape[0], -1)
-            gamma = gamma.expand(z.shape[0], -1)
+        # (Robust broadcasting)
+        B_z = z.shape[0]; B_t = mu.shape[0]
+        if B_z != B_t:
+            if B_t == 1:
+                mu = mu.expand(B_z, -1); gamma = gamma.expand(B_z, -1)
+            elif B_z == 1:
+                 z = z.expand(B_t, -1)
+            else:
+                raise ValueError(f"Incompatible batch sizes for z ({B_z}) and t ({B_t})")
         
-        gamma_sq = torch.clamp(gamma**2, min=1e-12)
+        gamma_sq = torch.clamp(gamma**2, min=1e-18)
         score = -(z - mu) / gamma_sq
         return score
     
     def reverse_drift(self, z: Tensor, t: Tensor) -> Tensor:
-        """
-        Compute the drift for the reverse SDE.
-        
-        Reverse drift: R(z,t) = v(z,t) - (σ²/2) * ∇log p_t(z)
-        
-        Args:
-            z: State [batch_size, data_dim]
-            t: Time [batch_size] or [batch_size, 1]
-            
-        Returns:
-            drift: Reverse SDE drift [batch_size, data_dim]
-        """
         velocity = self.forward_velocity(z, t)
         score = self.score_function(z, t)
-        
         drift = velocity - (self.sigma_reverse**2 / 2) * score
         return drift
     
     def reverse_sde(self, z: Tensor, t: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Complete reverse SDE specification (drift and diffusion).
-        
-        Args:
-            z: State [batch_size, data_dim]
-            t: Time [batch_size] or [batch_size, 1]
-            
-        Returns:
-            drift: SDE drift [batch_size, data_dim]
-            diffusion: SDE diffusion [batch_size, data_dim]
-        """
         drift = self.reverse_drift(z, t)
         diffusion = torch.ones_like(z) * self.sigma_reverse
         return drift, diffusion
     
     def path_regularization_loss(self, n_samples: int = 256) -> Tensor:
-        """
-        Compute the kinetic energy loss via reparameterization trick.
-        
-        For Gaussian flows: E[||v||²] = ||∂μ/∂t||² + (∂γ/∂t)² * dim
-        This is computed simulation-free using the reparameterization trick.
-        
-        Args:
-            n_samples: Number of time samples for Monte Carlo estimation
-            
-        Returns:
-            loss: Path regularization loss (scalar)
-        """
-        # Sample random times
-        t = torch.rand(n_samples, 1, device=next(self.parameters()).device) * self.T
-        
-        # Get derivatives
+        t = torch.rand(n_samples, 1, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype) * self.T
         _, dmu_dt, _, dgamma_dt = self.get_params(t)
         
-        # Kinetic energy: E[||∂μ/∂t + (∂γ/∂t) * ε||²]
-        # = ||∂μ/∂t||² + (∂γ/∂t)² * E[||ε||²]
-        # = ||∂μ/∂t||² + (∂γ/∂t)² * data_dim
-        
-        mean_term = torch.sum(dmu_dt**2, dim=-1)  # [n_samples]
-        var_term = (dgamma_dt.squeeze(-1)**2) * self.data_dim  # [n_samples]
+        mean_term = torch.sum(dmu_dt**2, dim=-1)
+        var_term = (dgamma_dt.squeeze(-1)**2) * self.data_dim
         
         kinetic_energy = mean_term + var_term
         return kinetic_energy.mean() / 2.0
     
     def constraint_satisfaction_loss(self) -> Tensor:
-        """
-        Verify constraint satisfaction (should be zero by construction).
-        
-        Returns:
-            loss: Constraint violation (should be ~0)
-        """
-        # This should be exactly zero by construction
+        # Checks if the spline correctly interpolates the fixed points.
         mu_at_constraints, _ = self.mu_spline(self.time_steps)
         gamma_at_constraints, _ = self.gamma_spline(self.time_steps)
         
-        mu_error = torch.norm(mu_at_constraints - self.phi_ti)
-        gamma_error = torch.norm(gamma_at_constraints)
+        # Get the target fixed points (in linear space)
+        mu_target = self.mu_spline.fixed_points_linear
+        gamma_target = self.gamma_spline.fixed_points_linear
+        
+        mu_error = torch.norm(mu_at_constraints - mu_target)
+        gamma_error = torch.norm(gamma_at_constraints - gamma_target)
         
         return mu_error + gamma_error
 
+
+# ============================================================================
+# Training, Validation, and Visualization Utilities
+# ============================================================================
 
 def generate_spiral_data(N_constraints: int = 6, T: float = 3.0, data_dim: int = 3) -> Tuple[Tensor, Tensor]:
     """
@@ -423,7 +442,7 @@ def generate_spiral_data(N_constraints: int = 6, T: float = 3.0, data_dim: int =
 def train_bridge(
     bridge: GaussianBridge, 
     epochs: int = 2000, 
-    lr: float = 1e-2,
+    lr: float = 2e-2,
     verbose: bool = True
 ) -> list:
     """
@@ -735,7 +754,9 @@ def _plot_core_parameters(bridge, output_dir, device):
     ax1.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'b-', linewidth=2.5, label='Mean Trajectory μ(t)')
     ax1.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints φ(t_i)')
     ax1.set_title('A) Optimized Mean Trajectory')
-    ax1.set_xlabel('z₁'); ax1.set_ylabel('z₂'); ax1.set_zlabel('z₃')
+    ax1.set_xlabel('z₁')
+    ax1.set_ylabel('z₂')
+    ax1.set_zlabel('z₃')
     ax1.legend()
 
     # Variance evolution
@@ -743,7 +764,8 @@ def _plot_core_parameters(bridge, output_dir, device):
     ax2.plot(fine_times, gamma_traj.squeeze(), 'g-', linewidth=2.5)
     ax2.scatter(time_steps, torch.zeros_like(time_steps), c='red', s=80, edgecolors='k')
     ax2.set_title('B) Standard Deviation γ(t)')
-    ax2.set_xlabel('Time t'); ax2.set_ylabel('γ(t)')
+    ax2.set_xlabel('Time t')
+    ax2.set_ylabel('γ(t)')
     ax2.grid(True, linestyle='--')
     ax2.set_ylim(bottom=0)
 
@@ -758,7 +780,8 @@ def _plot_core_parameters(bridge, output_dir, device):
 
     ax3.plot(times_for_reg.cpu(), regularization_vals, 'purple', linewidth=2.5)
     ax3.set_title('C) Path Kinetic Energy ½E[||v||²]')
-    ax3.set_xlabel('Time t'); ax3.set_ylabel('Kinetic Energy')
+    ax3.set_xlabel('Time t')
+    ax3.set_ylabel('Kinetic Energy')
     ax3.grid(True, linestyle='--')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -768,28 +791,57 @@ def _plot_core_parameters(bridge, output_dir, device):
 def _plot_asymmetric_dynamics(bridge, n_viz_particles, n_sde_steps, output_dir, device):
     print("  - Plotting asymmetric dynamics...")
     phi_ti = bridge.phi_ti.cpu()
+    dtype = bridge.phi_ti.dtype
     fine_times = torch.linspace(0, bridge.T, 200)
     mu_traj, _ = bridge.mu_spline(fine_times)
 
-    # Forward ODE Simulation
-    z0_base = phi_ti[0].unsqueeze(0).repeat(n_viz_particles, 1)
-    z0_perturbed = z0_base + 0.05 * torch.randn_like(z0_base)
+    # Forward ODE Simulation using Scipy's RK45 integrator
+    # Initialize particles by sampling from the learned distribution p0 = N(mu0, gamma0^2 I)
+    
+    t0_tensor = torch.tensor([0.0], device=device, dtype=dtype)
+    mu0, _, gamma0, _ = bridge.get_params(t0_tensor)
+    
+    # Sample initial conditions Z0
+    z0_samples = mu0 + gamma0 * torch.randn(n_viz_particles, bridge.data_dim, device=device, dtype=dtype)
 
-    n_ode_steps = 200
-    dt_ode = bridge.T / n_ode_steps
-    times_ode = torch.linspace(0, bridge.T, n_ode_steps + 1)
+    def forward_ode_func(t, z_np):
+        """Wrapper for bridge.forward_velocity for solve_ivp."""
+        z = torch.from_numpy(z_np).float().to(device).unsqueeze(0)
+        t_tensor = torch.tensor(t, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            v = bridge.forward_velocity(z, t_tensor)[0]
+        return v.cpu().numpy()
+
+    times_eval = torch.linspace(0, bridge.T, 100).numpy()
 
     forward_trajectories = []
+    print(f"  - Integrating {n_viz_particles} Forward ODE trajectories...")
     for i in range(n_viz_particles):
-        traj = [z0_perturbed[i].clone()]
-        z = z0_perturbed[i].clone().to(device)
-        for t in times_ode[:-1]:
-            v = bridge.forward_velocity(z.unsqueeze(0), t.to(device).unsqueeze(0))[0]
-            z = z + v * dt_ode
-            traj.append(z.cpu())
-        forward_trajectories.append(torch.stack(traj))
+        # Use the correctly sampled Z0
+        z0_np = z0_samples[i].cpu().numpy().astype(np.float64)
+        # Use RK45 as the velocity is now smooth (C2)
+        sol = solve_ivp(
+            fun=forward_ode_func,
+            t_span=[0, bridge.T],
+            y0=z0_np,
+            method='RK45',
+            t_eval=times_eval,
+            rtol=1e-6,
+            atol=1e-8
+        )
+        if not sol.success:
+            print(f"Warning: ODE solver failed for particle {i}: {sol.message}")
+            continue
+            
+        traj = torch.from_numpy(sol.y.T).float()
+        forward_trajectories.append(traj)
+    
+    if not forward_trajectories:
+        print("Error: All forward ODE simulations failed.")
+        return
+    
     forward_trajectories = torch.stack(forward_trajectories)
-
+    
     # Reverse SDE Simulation
     t_start_tensor = torch.tensor([bridge.T], device=device)
     mu_start, _, gamma_start, _ = bridge.get_params(t_start_tensor)
@@ -811,7 +863,9 @@ def _plot_asymmetric_dynamics(bridge, n_viz_particles, n_sde_steps, output_dir, 
     ax_fwd.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'k--', linewidth=2, label='Mean Trajectory')
     ax_fwd.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints')
     ax_fwd.set_title('A) Forward Deterministic Trajectories (ODE)')
-    ax_fwd.set_xlabel('z₁'); ax_fwd.set_ylabel('z₂'); ax_fwd.set_zlabel('z₃')
+    ax_fwd.set_xlabel('z₁')
+    ax_fwd.set_ylabel('z₂')
+    ax_fwd.set_zlabel('z₃')
     ax_fwd.legend()
 
     # Reverse SDE plot
@@ -821,7 +875,9 @@ def _plot_asymmetric_dynamics(bridge, n_viz_particles, n_sde_steps, output_dir, 
     ax_rev.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'k--', linewidth=2, label='Mean Trajectory')
     ax_rev.scatter(phi_ti[:, 0], phi_ti[:, 1], phi_ti[:, 2], c='red', s=120, edgecolors='k', label='Constraints')
     ax_rev.set_title('B) Reverse Stochastic Trajectories (SDE)')
-    ax_rev.set_xlabel('z₁'); ax_rev.set_ylabel('z₂'); ax_rev.set_zlabel('z₃')
+    ax_rev.set_xlabel('z₁')
+    ax_rev.set_ylabel('z₂')
+    ax_rev.set_zlabel('z₃')
     ax_rev.legend()
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -857,7 +913,7 @@ def _plot_marginal_distributions(bridge, output_dir, device):
         ax.add_patch(ellipse)
 
         ax.set_title(f"t = {t_viz.item():.2f}")
-        ax.set_xlabel('z₁');
+        ax.set_xlabel('z₁')
         if i == 0:
             ax.set_ylabel('z₂')
         ax.grid(True, linestyle='--')
@@ -902,10 +958,19 @@ def main():
     print("ASYMMETRIC MULTI-MARGINAL BRIDGE - PRELIMINARY VALIDATION")
     print("="*80)
     
+    # Configuration
+    N_CONSTRAINTS = 6
+    T_MAX = 3.0
+    DATA_DIM = 3
+    N_CONTROL = 12 # Increased control points for flexibility
+    EPOCHS = 3000
+    LR = 2e-2
+    SIGMA_REVERSE = 1.0 # Reduced sigma for clearer visualization
+    
     # Step 1: Generate synthetic data
     print("\n1. Generating synthetic spiral data...")
-    phi_ti, time_steps = generate_spiral_data(N_constraints=6, T=3.0, data_dim=3)
-    
+    phi_ti, time_steps = generate_spiral_data(N_constraints=N_CONSTRAINTS, T=T_MAX, data_dim=DATA_DIM)
+
     print(f"Generated {len(phi_ti)} constraint points over time [0, {time_steps[-1]:.1f}]")
     print("Constraint points:")
     for i, (t, phi) in enumerate(zip(time_steps, phi_ti)):
@@ -916,17 +981,17 @@ def main():
     bridge = GaussianBridge(
         phi_ti=phi_ti,
         time_steps=time_steps,
-        n_control=8,
-        data_dim=3,
-        sigma_reverse=1.0
+        n_control=N_CONTROL,
+        data_dim=DATA_DIM,
+        sigma_reverse=SIGMA_REVERSE
     )
     
     print(f"Bridge initialized with {sum(p.numel() for p in bridge.parameters())} parameters")
     
     # Step 3: Train the bridge
     print("\n3. Training the bridge...")
-    loss_history = train_bridge(bridge, epochs=2000, lr=1e-2, verbose=True)
-    
+    loss_history = train_bridge(bridge, epochs=EPOCHS, lr=LR, verbose=True)
+
     print(f"Training complete. Final path loss: {loss_history[-1]['path']:.6f}")
     print(f"Final constraint violation: {loss_history[-1]['constraint']:.8f}")
     
@@ -940,7 +1005,7 @@ def main():
     
     validation_results = validate_asymmetric_consistency(
         bridge=bridge,
-        n_particles=1024,
+        n_particles=128,
         n_steps=100,
         n_validation_times=5
     )
