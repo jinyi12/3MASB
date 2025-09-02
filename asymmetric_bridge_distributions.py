@@ -34,6 +34,8 @@ except ImportError:
     ot = None
 import os
 from scipy.integrate import solve_ivp
+from scipy.stats import gaussian_kde
+
 
 # ============================================================================
 # Utilities (Adapted from sde_matching.py)
@@ -624,11 +626,12 @@ def _plot_marginal_distribution_comparison(
     ).cpu() # Shape [n_steps+1, n_particles, dim]
 
     # --- Plotting ---
-    fig, axes = plt.subplots(1, len(validation_times), figsize=(6 * len(validation_times), 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, len(validation_times), figsize=(6 * len(validation_times), 11), sharex=True, sharey=True)
     fig.suptitle("Figure 3: Comparison of Marginal Distributions p_t(z)", fontsize=16)
 
     for i, t_val in enumerate(validation_times):
-        ax = axes[i]
+        ax_scatter = axes[0, i]
+        ax_contour = axes[1, i]
 
         # Find closest time index
         forward_idx = np.argmin(np.abs(times_eval - t_val))
@@ -643,23 +646,55 @@ def _plot_marginal_distribution_comparison(
         t_tensor = torch.tensor([[t_val]], device=device)
         mu_gt, gamma_gt = bridge.get_params(t_tensor)
         mu_gt = mu_gt[0].cpu().numpy()
-        cov_gt = torch.diag(gamma_gt[0].cpu().numpy()**2)
+        cov_gt = torch.diag(gamma_gt[0]**2).cpu().numpy()
 
-        # Plot (projected on z1-z2 plane)
-        ax.scatter(fwd_particles[:, 0], fwd_particles[:, 1], alpha=0.3, label='Fwd ODE', color='blue', s=10)
-        ax.scatter(rev_particles[:, 0], rev_particles[:, 1], alpha=0.3, label='Rev SDE', color='green', s=10)
-
-        # Plot analytical mean and covariance ellipse
-        ax.scatter(mu_gt[0], mu_gt[1], marker='x', color='red', s=100, label='Learned Mean')
-        plot_confidence_ellipse(ax, mu_gt, cov_gt, n_std=2.0, edgecolor='red', linewidth=2, linestyle='--')
-
-        ax.set_title(f't = {t_val:.2f}')
-        ax.set_xlabel('z₁')
+        # --- Scatter Plot (Top Row) ---
+        ax_scatter.scatter(fwd_particles[:, 0], fwd_particles[:, 1], alpha=0.3, label='Fwd ODE', color='blue', s=10)
+        ax_scatter.scatter(rev_particles[:, 0], rev_particles[:, 1], alpha=0.3, label='Rev SDE', color='green', s=10)
+        ax_scatter.scatter(mu_gt[0], mu_gt[1], marker='x', color='red', s=100, label='Learned Mean')
+        plot_confidence_ellipse(ax_scatter, mu_gt, cov_gt, n_std=2.0, edgecolor='red', linewidth=2, linestyle='--')
+        ax_scatter.set_title(f't = {t_val:.2f}')
         if i == 0:
-            ax.set_ylabel('z₂')
-        ax.grid(True, linestyle='--')
-        ax.legend()
-        ax.set_aspect('equal', adjustable='box')
+            ax_scatter.set_ylabel('z₂ (Scatter)')
+        ax_scatter.grid(True, linestyle='--')
+        ax_scatter.legend()
+        ax_scatter.set_aspect('equal', adjustable='box')
+
+        # --- KDE Contour Plot (Bottom Row) ---
+        all_particles = np.vstack([fwd_particles, rev_particles])
+        xmin, xmax = all_particles[:, 0].min(), all_particles[:, 0].max()
+        ymin, ymax = all_particles[:, 1].min(), all_particles[:, 1].max()
+        x_range = xmax - xmin
+        y_range = ymax - ymin
+        grid_x, grid_y = np.mgrid[xmin - 0.1*x_range:xmax + 0.1*x_range:100j, ymin - 0.1*y_range:ymax + 0.1*y_range:100j]
+        grid_pts = np.vstack([grid_x.ravel(), grid_y.ravel()])
+
+        try:
+            kde_fwd = gaussian_kde(fwd_particles[:, :2].T)
+            kde_rev = gaussian_kde(rev_particles[:, :2].T)
+            density_fwd = kde_fwd(grid_pts).reshape(grid_x.shape)
+            density_rev = kde_rev(grid_pts).reshape(grid_y.shape)
+
+            # Plot contours
+            ax_contour.contour(grid_x, grid_y, density_fwd, colors='blue', linestyles='--', levels=5)
+            ax_contour.contour(grid_x, grid_y, density_rev, colors='green', linestyles='-', levels=5)
+            
+            # Create custom legend entries
+            from matplotlib.lines import Line2D
+            legend_elements = [Line2D([0], [0], color='blue', ls='--', label='Fwd ODE'),
+                               Line2D([0], [0], color='green', ls='-', label='Rev SDE')]
+            ax_contour.legend(handles=legend_elements)
+
+        except np.linalg.LinAlgError:
+            ax_contour.text(0.5, 0.5, "KDE failed (singular matrix)", ha='center', va='center', transform=ax_contour.transAxes)
+
+        ax_contour.set_title(f'KDE Contour Comparison')
+        ax_contour.set_xlabel('z₁')
+        if i == 0:
+            ax_contour.set_ylabel('z₂ (KDE)')
+        ax_contour.grid(True, linestyle=':')
+        ax_contour.set_aspect('equal', adjustable='box')
+
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(os.path.join(output_dir, "fig3_marginal_comparison.png"), dpi=300)
@@ -675,36 +710,73 @@ def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
     # Sort the times for consistent plotting order
     sorted_times = sorted(marginal_data.keys())
 
-    fig, axes = plt.subplots(1, n_marginals, figsize=(6 * n_marginals, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, n_marginals, figsize=(6 * n_marginals, 11), sharex=True, sharey=True)
     if n_marginals == 1: # If only one subplot, axes is not a list
-        axes = [axes]
+        axes = np.array([[axes[0]], [axes[1]]])
 
     fig.suptitle("Figure 4: Qualitative Fit to Marginal Data Constraints", fontsize=16)
 
     for i, t_k in enumerate(sorted_times):
-        ax = axes[i]
+        ax_scatter = axes[0, i]
+        ax_contour = axes[1, i]
         samples_k = marginal_data[t_k].cpu().numpy()
 
         # Get analytical distribution at time t_k
         t_k_tensor = torch.tensor([[t_k]], device=device)
         mu_k, gamma_k = bridge.get_params(t_k_tensor)
-        mu_k = mu_k[0].cpu().numpy()
-        cov_k = torch.diag(gamma_k[0].cpu().numpy()**2)
+        mu_k_np = mu_k[0].cpu().numpy()
+        cov_k = torch.diag(gamma_k[0]**2).cpu().numpy()
 
-        # Plot the data samples (projected on z1-z2 plane)
-        ax.scatter(samples_k[:, 0], samples_k[:, 1], alpha=0.5, label='Data Samples', s=15, color='gray')
-
-        # Plot the learned distribution's mean and covariance ellipse
-        ax.scatter(mu_k[0], mu_k[1], marker='P', color='orange', s=150, label='Learned Mean', edgecolors='black')
-        plot_confidence_ellipse(ax, mu_k, cov_k, n_std=2.0, edgecolor='orange', linewidth=2.5, linestyle='-')
-
-        ax.set_title(f't = {t_k:.2f}')
-        ax.set_xlabel('z₁')
+        # --- Scatter Plot (Top Row) ---
+        ax_scatter.scatter(samples_k[:, 0], samples_k[:, 1], alpha=0.5, label='Data Samples', s=15, color='gray')
+        ax_scatter.scatter(mu_k_np[0], mu_k_np[1], marker='P', color='orange', s=150, label='Learned Mean', edgecolors='black')
+        plot_confidence_ellipse(ax_scatter, mu_k_np, cov_k, n_std=2.0, edgecolor='orange', linewidth=2.5, linestyle='-')
+        ax_scatter.set_title(f't = {t_k:.2f}')
         if i == 0:
-            ax.set_ylabel('z₂')
-        ax.grid(True, linestyle='--')
-        ax.legend()
-        ax.set_aspect('equal', adjustable='box')
+            ax_scatter.set_ylabel('z₂ (Scatter)')
+        ax_scatter.grid(True, linestyle='--')
+        ax_scatter.legend()
+        ax_scatter.set_aspect('equal', adjustable='box')
+
+        # --- KDE Contour Plot (Bottom Row) ---
+        # Generate samples from the learned Gaussian for KDE comparison
+        learned_dist = D.MultivariateNormal(mu_k[0].cpu(), torch.from_numpy(cov_k).float())
+        learned_samples = learned_dist.sample((samples_k.shape[0],)).numpy()
+
+        all_particles = np.vstack([samples_k, learned_samples])
+        xmin, xmax = all_particles[:, 0].min(), all_particles[:, 0].max()
+        ymin, ymax = all_particles[:, 1].min(), all_particles[:, 1].max()
+        x_range = xmax - xmin
+        y_range = ymax - ymin
+        grid_x, grid_y = np.mgrid[xmin - 0.1*x_range:xmax + 0.1*x_range:100j, ymin - 0.1*y_range:ymax + 0.1*y_range:100j]
+        grid_pts = np.vstack([grid_x.ravel(), grid_y.ravel()])
+
+        try:
+            kde_data = gaussian_kde(samples_k[:, :2].T)
+            kde_learned = gaussian_kde(learned_samples[:, :2].T)
+            density_data = kde_data(grid_pts).reshape(grid_x.shape)
+            density_learned = kde_learned(grid_pts).reshape(grid_y.shape)
+
+            # Plot contours
+            ax_contour.contour(grid_x, grid_y, density_data, colors='gray', linestyles='-', levels=5)
+            ax_contour.contour(grid_x, grid_y, density_learned, colors='orange', linestyles='--', levels=5)
+
+            # Create custom legend entries
+            from matplotlib.lines import Line2D
+            legend_elements = [Line2D([0], [0], color='gray', ls='-', label='Data'),
+                               Line2D([0], [0], color='orange', ls='--', label='Learned')]
+            ax_contour.legend(handles=legend_elements)
+
+        except np.linalg.LinAlgError:
+            ax_contour.text(0.5, 0.5, "KDE failed (singular matrix)", ha='center', va='center', transform=ax_contour.transAxes)
+
+        ax_contour.set_title(f'KDE Contour Comparison')
+        ax_contour.set_xlabel('z₁')
+        if i == 0:
+            ax_contour.set_ylabel('z₂ (KDE)')
+        ax_contour.grid(True, linestyle=':')
+        ax_contour.set_aspect('equal', adjustable='box')
+
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(os.path.join(output_dir, "fig4_marginal_fit.png"), dpi=300)
@@ -721,12 +793,14 @@ def _plot_data_and_trajectory(bridge, marginal_data, T, output_dir, device):
     mu_traj = mu_traj.cpu()
     gamma_traj = gamma_traj.cpu()
 
-    fig = plt.figure(figsize=(18, 6))
-    fig.suptitle("Figure 1: Learned Distributional Flow", fontsize=16)
+    # fig = plt.figure(figsize=(18, 6))
+    fig = plt.figure(figsize=(7, 4))
+    fig.suptitle("Figure 1: Learned Distributional Flow", fontsize=12)
 
     # 3D Trajectory and Data
-    ax1 = fig.add_subplot(131, projection='3d')
-    
+    # ax1 = fig.add_subplot(131, projection='3d')
+    ax1 = fig.add_subplot(111, projection='3d')
+
     # Plot data samples
     for t_k, samples_k in marginal_data.items():
         ax1.scatter(samples_k[:, 0], samples_k[:, 1], samples_k[:, 2], alpha=0.1, label=f'Data t={t_k:.1f}')
@@ -734,40 +808,40 @@ def _plot_data_and_trajectory(bridge, marginal_data, T, output_dir, device):
     # Plot learned mean trajectory
     ax1.plot(mu_traj[:, 0], mu_traj[:, 1], mu_traj[:, 2], 'r-', linewidth=2.5, label='Learned Mean μ(t)')
     
-    ax1.set_title('A) Data Marginals and Mean Trajectory')
+    ax1.set_title('A) Data Marginals and Mean Trajectory', fontsize=12)
     ax1.set_xlabel('z₁')
     ax1.set_ylabel('z₂')
     ax1.set_zlabel('z₃')
 
-    # Learned Standard Deviation evolution
-    ax2 = fig.add_subplot(132)
-    # Plotting each dimension of gamma
-    for i in range(bridge.data_dim):
-        ax2.plot(fine_times.cpu().squeeze(), gamma_traj[:, i], linewidth=2.5, label=f'γ_{i+1}(t)')
+    # # Learned Standard Deviation evolution
+    # ax2 = fig.add_subplot(132)
+    # # Plotting each dimension of gamma
+    # for i in range(bridge.data_dim):
+    #     ax2.plot(fine_times.cpu().squeeze(), gamma_traj[:, i], linewidth=2.5, label=f'γ_{i+1}(t)')
     
-    ax2.set_title('B) Learned Standard Deviation γ(t)')
-    ax2.set_xlabel('Time t')
-    ax2.set_ylabel('γ(t)')
-    ax2.grid(True, linestyle='--')
-    ax2.legend()
-    ax2.set_ylim(bottom=0)
+    # ax2.set_title('B) Learned Standard Deviation γ(t)')
+    # ax2.set_xlabel('Time t')
+    # ax2.set_ylabel('γ(t)')
+    # ax2.grid(True, linestyle='--')
+    # ax2.legend()
+    # ax2.set_ylim(bottom=0)
 
-    # Path regularization (kinetic energy) over time
-    ax3 = fig.add_subplot(133)
-    # We estimate the kinetic energy at the fine_times
-    _, _, dmu_dt, dgamma_dt = bridge.get_params_and_derivs(fine_times)
-    dmu_dt = dmu_dt.cpu()
-    dgamma_dt = dgamma_dt.cpu()
+    # # Path regularization (kinetic energy) over time
+    # ax3 = fig.add_subplot(133)
+    # # We estimate the kinetic energy at the fine_times
+    # _, _, dmu_dt, dgamma_dt = bridge.get_params_and_derivs(fine_times)
+    # dmu_dt = dmu_dt.cpu()
+    # dgamma_dt = dgamma_dt.cpu()
 
-    mean_term = torch.sum(dmu_dt**2, dim=-1)
-    var_term = torch.sum(dgamma_dt**2, dim=-1)
-    kinetic_energy = (mean_term + var_term) / 2.0
+    # mean_term = torch.sum(dmu_dt**2, dim=-1)
+    # var_term = torch.sum(dgamma_dt**2, dim=-1)
+    # kinetic_energy = (mean_term + var_term) / 2.0
 
-    ax3.plot(fine_times.cpu().squeeze(), kinetic_energy, 'purple', linewidth=2.5)
-    ax3.set_title('C) Path Kinetic Energy ½E[||v||²]')
-    ax3.set_xlabel('Time t')
-    ax3.set_ylabel('Kinetic Energy')
-    ax3.grid(True, linestyle='--')
+    # ax3.plot(fine_times.cpu().squeeze(), kinetic_energy, 'purple', linewidth=2.5)
+    # ax3.set_title('C) Path Kinetic Energy ½E[||v||²]')
+    # ax3.set_xlabel('Time t')
+    # ax3.set_ylabel('Kinetic Energy')
+    # ax3.grid(True, linestyle='--')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(os.path.join(output_dir, "fig1_flow_parameters.png"), dpi=300)
@@ -912,7 +986,7 @@ def main():
     print("="*80)
     
     # Step 1: Generate synthetic distributional data
-    print("\\n1. Generating synthetic distributional spiral data...")
+    print("\n1. Generating synthetic distributional spiral data...")
     marginal_data, time_steps = generate_spiral_distributional_data(
         N_constraints=N_CONSTRAINTS, 
         T=T_MAX, 
@@ -927,7 +1001,7 @@ def main():
     print(f"Generated {len(marginal_data)} marginal distributions.")
     
     # Step 2: Initialize bridge
-    print("\\n2. Initializing Neural Gaussian Bridge...")
+    print("\n2. Initializing Neural Gaussian Bridge...")
     bridge = NeuralGaussianBridge(
         data_dim=DATA_DIM,
         hidden_size=HIDDEN_SIZE,
@@ -938,7 +1012,7 @@ def main():
     print(f"Bridge initialized with {sum(p.numel() for p in bridge.parameters())} parameters")
     
     # Step 3: Train the bridge
-    print("\\n3. Training the bridge (MLE + Path Regularization)...")
+    print("\n3. Training the bridge (MLE + Path Regularization)...")
     loss_history = train_bridge(
         bridge, 
         marginal_data, 
@@ -951,12 +1025,12 @@ def main():
     print(f"Training complete. Final Loss: {loss_history[-1]['total']:.4f}")
     
     # Step 4: Visualize results
-    print("\\n4. Visualizing results...")
-    visualize_bridge_results(bridge, marginal_data, T_MAX, n_viz_particles=50, n_sde_steps=100, output_dir=OUTPUT_DIR)
+    print("\n4. Visualizing results...")
+    visualize_bridge_results(bridge, marginal_data, T_MAX, n_viz_particles=1000, n_sde_steps=100, output_dir=OUTPUT_DIR)
     
     # Step 5: Rigorous validation
-    print("\\n5. Performing rigorous asymmetric consistency validation...")
-    
+    print("\n5. Performing rigorous asymmetric consistency validation...")
+
     validation_results = validate_asymmetric_consistency(
         bridge=bridge,
         T=T_MAX,
@@ -967,7 +1041,7 @@ def main():
     )
     
     # Print validation summary
-    print("\\nVALIDATION SUMMARY:")
+    print("\nVALIDATION SUMMARY:")
     print("-" * 40)
     
     # Calculate means, handle potential NaNs
@@ -982,16 +1056,16 @@ def main():
         
         # Validation criteria
         if mean_errors < 0.05 and cov_errors < 0.1:
-             print("\\n✅ SUCCESS: Distributional interpolation and asymmetric consistency validated!")
+             print("\nDistributional interpolation and asymmetric consistency validated")
         else:
-            print("\\n⚠️  Validation metrics exceeded thresholds.")
+            print("\nValidation metrics exceeded thresholds.")
 
     else:
         print("Validation failed to run or produced no results.")
 
 
-    print("\\n" + "="*80)
-    print("IMPLEMENTATION AND VALIDATION COMPLETE")
+    print("\n" + "="*80)
+    print("IMPLEMENTATION AND VALIDATION RUN COMPLETE")
     print("="*80)
 
 
