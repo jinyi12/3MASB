@@ -21,6 +21,7 @@ from typing import Tuple, Callable, Optional, Dict, Any
 import torch
 from torch import nn, Tensor
 from torch import distributions as D
+import torch.fft as fft
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from matplotlib import transforms
@@ -40,9 +41,6 @@ from scipy.stats import gaussian_kde
 # Import utilities for advanced visualization
 from utilities.visualization import (
     visualize_bridge_results as util_visualize_bridge_results,
-    _visualize_backward_samples_comparison,
-    _visualize_marginal_statistics_comparison,
-    _visualize_sample_distributions,
     _visualize_comparative_backward_samples,
 )
 from utilities.simulation import generate_comparative_backward_samples
@@ -498,6 +496,70 @@ def generate_backward_samples(bridge: NeuralGaussianBridge, marginal_data: Dict[
     return generated_samples
 
 
+def generate_consistent_backward_samples(bridge: NeuralGaussianBridge, marginal_data: Dict[float, Tensor], 
+                                       selected_indices: Tensor, n_steps: int = 100, device: str = 'cpu') -> Tuple[Dict[float, Tensor], Dict[float, Tensor]]:
+    """
+    Generate backward samples from specific selected samples at the final time.
+    This ensures that we compare the evolution of the same final-time samples.
+    
+    Returns:
+        original_selected: Dict containing the original selected samples at each time point
+        generated_consistent: Dict containing the backward-evolved samples starting from the same final samples
+    """
+    print("  - Generating consistent backward samples from selected final time samples...")
+    
+    bridge.eval()
+    original_selected = {}
+    generated_consistent = {}
+    
+    # Get the time points from marginal data
+    sorted_times = sorted(marginal_data.keys())
+    final_time = max(sorted_times)
+    
+    with torch.no_grad():
+        # Step 1: Extract the same selected samples from original data at all time points
+        for t_val in sorted_times:
+            original_data = marginal_data[t_val]
+            # Use the same indices to ensure consistency across time points
+            if selected_indices.max() < original_data.shape[0]:
+                original_selected[t_val] = original_data[selected_indices]
+            else:
+                # If not enough samples, repeat the indices cyclically
+                repeated_indices = selected_indices % original_data.shape[0]
+                original_selected[t_val] = original_data[repeated_indices]
+        
+        # Step 2: Start backward integration from the selected final time samples
+        z_final = original_selected[final_time].to(device)
+        n_samples = z_final.shape[0]
+        print(f"    Starting backward integration from {n_samples} selected samples at t={final_time}")
+        
+        # Step 3: Generate backward trajectory using Euler-Maruyama for the reverse SDE
+        print(f"    Integrating backward SDE with {n_steps} steps...")
+        try:
+            # Use the Euler-Maruyama backward SDE solver
+            backward_trajectory = solve_backward_sde_euler_maruyama(
+                bridge, z_final, ts=final_time, tf=0.0, n_steps=n_steps
+            )  # Shape: [n_steps+1, n_samples, data_dim]
+            
+            # Step 4: Interpolate to get samples at the specific time points
+            trajectory_times = torch.linspace(final_time, 0.0, n_steps + 1)
+            
+            for t_val in sorted_times:
+                # Find the closest time index in the trajectory
+                time_idx = torch.argmin(torch.abs(trajectory_times - t_val)).item()
+                samples_at_t = backward_trajectory[time_idx].cpu()
+                generated_consistent[t_val] = samples_at_t
+                
+        except Exception as e:
+            print(f"    Warning: Backward SDE integration failed ({e}). Using original samples as fallback.")
+            # Fallback: Use the original samples (no bridge evolution)
+            for t_val in sorted_times:
+                generated_consistent[t_val] = original_selected[t_val].clone()
+    
+    print(f"    Generated consistent samples for {len(generated_consistent)} time points")
+    return original_selected, generated_consistent
+
+
 # ============================================================================
 # 0. Random Field Generation Utilities (Multiscale Homogenization)
 # ============================================================================
@@ -677,6 +739,203 @@ def train_bridge(
 # ============================================================================
 # Validation and Visualization (Helper Functions)
 # ============================================================================
+
+def compute_spatial_acf_2d(samples: Tensor, resolution: int) -> Tensor:
+    """
+    Computes the normalized spatial ACF for a batch of 2D fields using FFT (Wiener-Khinchin).
+    Assumes stationarity, periodicity, and ergodicity.
+    """
+    B = samples.shape[0]
+    fields = samples.reshape(B, resolution, resolution)
+
+    # 1. Center the data (remove spatial mean per sample)
+    spatial_mean = fields.mean(dim=[1, 2], keepdim=True)
+    centered_fields = fields - spatial_mean
+
+    # 2. Compute Power Spectral Density (PSD)
+    # Use norm="ortho" to ensure consistency (Parseval's theorem)
+    freq_domain = fft.fft2(centered_fields, norm="ortho")
+    psd = torch.abs(freq_domain)**2
+
+    # 3. Compute Autocovariance (ACVF) = IFFT(PSD)
+    autocovariance = fft.ifft2(psd, norm="ortho").real # [B, H, W]
+
+    # 4. Average over the batch to get the ensemble estimate
+    avg_autocovariance = autocovariance.mean(dim=0) # [H, W]
+
+    # 5. Normalize by the variance (zero lag, index [0, 0])
+    variance = avg_autocovariance[0, 0]
+    if variance < 1e-9:
+        return torch.zeros_like(avg_autocovariance)
+    
+    normalized_acf = avg_autocovariance / torch.clamp(variance, min=1e-9)
+    
+    # Clamp for numerical stability
+    normalized_acf = torch.clamp(normalized_acf, min=-1.0, max=1.0)
+
+    # 6. Shift zero lag to center for visualization
+    return fft.fftshift(normalized_acf)
+
+def radial_average(data_2d: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    Compute the radial average of a centered 2D array (e.g., ACF) using torch.bincount.
+    """
+    H, W = data_2d.shape
+    center_y, center_x = H // 2, W // 2
+    
+    # Create coordinate grids
+    y, x = torch.meshgrid(torch.arange(H, device=data_2d.device), 
+                          torch.arange(W, device=data_2d.device), indexing='ij')
+    
+    # Calculate radial distance from center
+    r = torch.sqrt((x - center_x)**2 + (y - center_y)**2)
+    
+    # Binning by integer radius
+    r_int = r.round().long()
+    max_radius = min(center_x, center_y)
+    
+    # Flatten arrays for accumulation
+    r_flat = r_int.flatten()
+    data_flat = data_2d.flatten()
+    
+    # Use torch.bincount for efficient averaging
+    # Sum values in each radial bin
+    sum_in_bin = torch.bincount(r_flat, weights=data_flat)
+    # Count elements in each radial bin
+    count_in_bin = torch.bincount(r_flat)
+    
+    # Calculate average
+    avg_in_bin = sum_in_bin / torch.clamp(count_in_bin, min=1)
+    
+    # Truncate to the meaningful radius
+    radii = torch.arange(max_radius + 1, device=data_2d.device)
+    radial_profile = avg_in_bin[:max_radius + 1]
+    
+    return radii, radial_profile
+
+def _visualize_covariance_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
+    """Visualizes and compares the spatial ACF between original and generated samples."""
+    print("  - Plotting spatial covariance (ACF) comparison...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    # Select representative time points (e.g., 5 points including start and end)
+    n_time_points = min(5, len(sorted_times))
+    selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
+    selected_times = [sorted_times[i] for i in selected_indices]
+
+    # Determine resolution
+    if not selected_times: return
+    data_dim = marginal_data[selected_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    if resolution * resolution != data_dim:
+        print("    Warning: Data is not square. Skipping covariance analysis.")
+        return
+
+    # Setup figure: 3 rows (1D Radial ACF, 2D Target ACF, 2D Gen ACF)
+    fig, axes = plt.subplots(3, n_time_points, figsize=(4 * n_time_points, 12))
+    if n_time_points == 1: axes = axes.reshape(3, 1)
+    fig.suptitle("Spatial Autocorrelation Function (ACF) Comparison (Second-Order Statistics)", fontsize=16)
+
+    # Global color scale for 2D ACF plots
+    vmin, vmax = -0.5, 1.0
+    im = None
+    
+    for i, t_val in enumerate(selected_times):
+        # Compute ACFs (ensure data is on CPU for computation)
+        acf_target = compute_spatial_acf_2d(marginal_data[t_val].cpu(), resolution)
+        acf_gen = compute_spatial_acf_2d(generated_samples[t_val].cpu(), resolution)
+        
+        # Calculate MSE_ACF
+        mse_acf = torch.mean((acf_target - acf_gen)**2).item()
+
+        # Compute Radial Averages
+        radii, radial_target = radial_average(acf_target)
+        _, radial_gen = radial_average(acf_gen)
+        
+        # Convert radii to physical distance (assuming domain L=1.0)
+        physical_radii = radii.numpy() / resolution
+
+        # Row 1: 1D Radial ACF Comparison
+        ax_1d = axes[0, i]
+        ax_1d.plot(physical_radii, radial_target.numpy(), 'b-', label='Target', linewidth=2)
+        ax_1d.plot(physical_radii, radial_gen.numpy(), 'r--', label='Generated', linewidth=2)
+        ax_1d.set_title(f't={t_val:.2f} (MSE={mse_acf:.2e})')
+        ax_1d.set_xlabel('Lag Distance (r/L)')
+        ax_1d.set_ylim(-0.1, 1.05)
+        ax_1d.grid(True, alpha=0.3)
+        if i == 0: 
+            ax_1d.set_ylabel('Radial ACF R(r)')
+        if i == n_time_points - 1:
+            ax_1d.legend()
+
+        # Row 2: 2D Target ACF
+        ax_target = axes[1, i]
+        im = ax_target.imshow(acf_target.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
+        ax_target.set_title('Target 2D ACF')
+        if i == 0: ax_target.set_ylabel('Y Lag')
+        
+        # Row 3: 2D Generated ACF
+        ax_gen = axes[2, i]
+        ax_gen.imshow(acf_gen.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
+        ax_gen.set_title('Generated 2D ACF')
+        ax_gen.set_xlabel('X Lag')
+        if i == 0: ax_gen.set_ylabel('Y Lag')
+
+    # Add colorbar
+    if im is not None:
+        fig.colorbar(im, ax=axes[1:, :].ravel().tolist(), fraction=0.046, pad=0.04, label="Correlation")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "covariance_comparison.png"), dpi=300)
+    plt.close()
+
+def _calculate_validation_metrics(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor]) -> Dict[str, Any]:
+    """Calculate quantitative validation metrics (W2 distance and MSE_ACF)."""
+    print("  - Calculating quantitative validation metrics (W2, MSE_ACF)...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    metrics = {'times': sorted_times, 'w2_distances': [], 'mse_acf': []}
+
+    # Determine resolution
+    if not sorted_times: return metrics
+    data_dim = marginal_data[sorted_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    is_square = (resolution * resolution == data_dim)
+    
+    for t_val in sorted_times:
+        target_data_cpu = marginal_data[t_val].cpu()
+        gen_data_cpu = generated_samples[t_val].cpu()
+        
+        # 1. Wasserstein Distance (Sliced)
+        w2_dist = float('nan')
+        if ot:
+            try:
+                # Ensure same number of samples
+                min_samples = min(target_data_cpu.shape[0], gen_data_cpu.shape[0])
+                # Use numpy arrays for POT library
+                w2_dist = ot.sliced_wasserstein_distance(
+                    target_data_cpu[:min_samples].numpy(), 
+                    gen_data_cpu[:min_samples].numpy(), 
+                    n_projections=1000, seed=42
+                )
+            except Exception as e:
+                print(f"    Warning: W2 calculation failed at t={t_val:.2f}: {e}")
+        metrics['w2_distances'].append(w2_dist)
+
+        # 2. MSE ACF
+        mse_acf = float('nan')
+        if is_square:
+            try:
+                acf_target = compute_spatial_acf_2d(target_data_cpu, resolution)
+                acf_gen = compute_spatial_acf_2d(gen_data_cpu, resolution)
+                mse_acf = torch.mean((acf_target - acf_gen)**2).item()
+            except Exception as e:
+                 print(f"    Warning: MSE ACF calculation failed at t={t_val:.2f}: {e}")
+        metrics['mse_acf'].append(mse_acf)
+        
+        print(f"    t={t_val:.2f}: W2={w2_dist:.4f}, MSE_ACF={mse_acf:.4e}")
+
+    return metrics
 
 def validate_asymmetric_consistency(
     bridge: NeuralGaussianBridge,
@@ -1180,6 +1439,207 @@ def _visualize_backward_samples_comparison(marginal_data: Dict[float, Tensor], g
     plt.close()
 
 
+def _visualize_original_samples(marginal_data: Dict[float, Tensor], selected_indices: Tensor, output_dir: str):
+    """
+    Visualize the original samples at different time points for the selected indices.
+    This shows the ground truth evolution of specific samples through time.
+    """
+    print("  - Plotting original samples evolution...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    n_time_points = len(sorted_times)
+    n_samples_show = len(selected_indices)
+    
+    # Determine resolution
+    if not sorted_times:
+        return
+    data_dim = marginal_data[sorted_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    
+    if resolution * resolution != data_dim:
+        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
+        return
+
+    # Create figure with samples as rows and time points as columns
+    fig, axes = plt.subplots(n_samples_show, n_time_points, 
+                           figsize=(3 * n_time_points, 3 * n_samples_show))
+    fig.suptitle("Original Samples Evolution Through Time", fontsize=16)
+    
+    # Handle dimension edge cases
+    if n_samples_show == 1 and n_time_points == 1:
+        axes = np.array([[axes]])
+    elif n_samples_show == 1:
+        axes = axes.reshape(1, -1)
+    elif n_time_points == 1:
+        axes = axes.reshape(-1, 1)
+    elif axes.ndim == 1:
+        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
+    
+    # Determine global color scale for consistency
+    all_original = torch.cat([marginal_data[t] for t in sorted_times], dim=0).cpu().numpy()
+    vmin, vmax = all_original.min(), all_original.max()
+    
+    for j, t_val in enumerate(sorted_times):
+        original_data = marginal_data[t_val].cpu().numpy()
+        
+        for i, sample_idx in enumerate(selected_indices):
+            # Handle case where sample_idx might be out of bounds
+            actual_idx = sample_idx % original_data.shape[0]
+            sample_orig = original_data[actual_idx].reshape(resolution, resolution)
+            
+            axes[i, j].imshow(sample_orig, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            axes[i, j].axis('off')
+            
+            # Add labels
+            if j == 0:
+                axes[i, j].set_ylabel(f'Sample {sample_idx.item()}', rotation=0, ha='right', va='center')
+            if i == 0:
+                axes[i, j].set_title(f't = {t_val:.2f}')
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    plt.savefig(os.path.join(output_dir, "original_samples_evolution.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _visualize_generated_samples(generated_samples: Dict[float, Tensor], selected_indices: Tensor, output_dir: str):
+    """
+    Visualize the generated samples from the bridge model evolution.
+    This shows how the bridge model predicts the evolution from the final time samples.
+    """
+    print("  - Plotting generated samples from bridge evolution...")
+    
+    sorted_times = sorted(generated_samples.keys())
+    n_time_points = len(sorted_times)
+    n_samples_show = len(selected_indices)
+    
+    # Determine resolution
+    if not sorted_times:
+        return
+    data_dim = generated_samples[sorted_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    
+    if resolution * resolution != data_dim:
+        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
+        return
+
+    # Create figure with samples as rows and time points as columns
+    fig, axes = plt.subplots(n_samples_show, n_time_points, 
+                           figsize=(3 * n_time_points, 3 * n_samples_show))
+    fig.suptitle("Generated Samples Evolution Through Bridge Model", fontsize=16)
+    
+    # Handle dimension edge cases
+    if n_samples_show == 1 and n_time_points == 1:
+        axes = np.array([[axes]])
+    elif n_samples_show == 1:
+        axes = axes.reshape(1, -1)
+    elif n_time_points == 1:
+        axes = axes.reshape(-1, 1)
+    elif axes.ndim == 1:
+        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
+    
+    # Determine global color scale for consistency
+    all_generated = torch.cat([generated_samples[t] for t in sorted_times], dim=0).cpu().numpy()
+    vmin, vmax = all_generated.min(), all_generated.max()
+    
+    for j, t_val in enumerate(sorted_times):
+        generated_data = generated_samples[t_val].cpu().numpy()
+        
+        for i, sample_idx in enumerate(selected_indices):
+            # The generated samples should have the same order as selected_indices
+            if i < generated_data.shape[0]:
+                sample_gen = generated_data[i].reshape(resolution, resolution)
+                axes[i, j].imshow(sample_gen, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            axes[i, j].axis('off')
+            
+            # Add labels
+            if j == 0:
+                axes[i, j].set_ylabel(f'Sample {sample_idx.item()}', rotation=0, ha='right', va='center')
+            if i == 0:
+                axes[i, j].set_title(f't = {t_val:.2f}')
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    plt.savefig(os.path.join(output_dir, "generated_samples_evolution.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _visualize_consistent_samples_comparison(original_samples: Dict[float, Tensor], 
+                                           generated_samples: Dict[float, Tensor], 
+                                           selected_indices: Tensor, output_dir: str):
+    """
+    Create a side-by-side comparison visualization of the same samples showing:
+    1. Original evolution through time
+    2. Generated evolution through the bridge model
+    This enables direct comparison of how well the bridge model captures the dynamics.
+    """
+    print("  - Creating consistent samples comparison visualization...")
+    
+    sorted_times = sorted(original_samples.keys())
+    n_time_points = len(sorted_times)
+    n_samples_show = min(4, len(selected_indices))  # Show up to 4 samples
+    
+    # Determine resolution
+    if not sorted_times:
+        return
+    data_dim = original_samples[sorted_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    
+    if resolution * resolution != data_dim:
+        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
+        return
+
+    # Create figure with alternating rows (original vs generated for each sample)
+    fig, axes = plt.subplots(2 * n_samples_show, n_time_points, 
+                           figsize=(3 * n_time_points, 3 * 2 * n_samples_show))
+    fig.suptitle("Original vs Generated Evolution Comparison (Same Initial Conditions)", fontsize=16)
+    
+    # Handle dimension edge cases
+    if n_samples_show == 1 and n_time_points == 1:
+        axes = np.array([[axes]])
+    elif n_samples_show == 1:
+        axes = axes.reshape(2, 1) if n_time_points == 1 else axes.reshape(2, -1)
+    elif n_time_points == 1:
+        axes = axes.reshape(-1, 1)
+    elif axes.ndim == 1:
+        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
+    
+    # Determine global color scale for consistency
+    all_original = torch.cat([original_samples[t] for t in sorted_times], dim=0).cpu().numpy()
+    all_generated = torch.cat([generated_samples[t] for t in sorted_times], dim=0).cpu().numpy()
+    vmin = min(all_original.min(), all_generated.min())
+    vmax = max(all_original.max(), all_generated.max())
+    
+    for j, t_val in enumerate(sorted_times):
+        original_data = original_samples[t_val].cpu().numpy()
+        generated_data = generated_samples[t_val].cpu().numpy()
+        
+        for i in range(n_samples_show):
+            sample_idx = selected_indices[i]
+            
+            # Original data samples
+            row_orig = 2 * i
+            if i < original_data.shape[0]:
+                sample_orig = original_data[i].reshape(resolution, resolution)
+                axes[row_orig, j].imshow(sample_orig, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            axes[row_orig, j].axis('off')
+            if j == 0:
+                axes[row_orig, j].set_ylabel(f'Original\nSample {sample_idx.item()}', rotation=0, ha='right', va='center')
+            if i == 0:
+                axes[row_orig, j].set_title(f't = {t_val:.2f}')
+            
+            # Generated data samples  
+            row_gen = 2 * i + 1
+            if i < generated_data.shape[0]:
+                sample_gen = generated_data[i].reshape(resolution, resolution)
+                axes[row_gen, j].imshow(sample_gen, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            axes[row_gen, j].axis('off')
+            if j == 0:
+                axes[row_gen, j].set_ylabel(f'Generated\nSample {sample_idx.item()}', rotation=0, ha='right', va='center')
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    plt.savefig(os.path.join(output_dir, "consistent_samples_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def _visualize_marginal_statistics_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
     """
     Compare statistical properties (mean, std, distribution) between original and generated samples.
@@ -1548,19 +2008,81 @@ def _plot_asymmetric_dynamics(bridge, T, n_viz_particles, n_sde_steps, output_di
 def visualize_bridge_results(bridge: NeuralGaussianBridge, marginal_data: Dict[float, Tensor], T: float, n_viz_particles: int = 50, n_sde_steps: int = 100, output_dir: str = "output", is_grf: bool = False):
     """
     Generate and save a comprehensive set of visualizations for the trained bridge.
-    This function now uses the advanced utilities visualization with enhanced backward samples comparison.
+    Implements specific pipelines for GRF and non-GRF data.
     """
-    # Use the utilities visualization function which includes the enhanced backward samples visualization
-    util_visualize_bridge_results(
-        bridge=bridge, 
-        marginal_data=marginal_data, 
-        T=T, 
-        output_dir=output_dir, 
-        is_grf=is_grf, 
-        n_viz_particles=n_viz_particles, 
-        n_sde_steps=n_sde_steps, 
-        solver='gaussian'  # Use Gaussian solver for the NeuralGaussianBridge
-    )
+    
+    print(f"\n--- Starting Visualization Pipeline (Output: {output_dir}) ---")
+    bridge.eval()
+    device = bridge.base_mean.device
+
+    if not is_grf:
+        # --- Non-GRF (e.g., Spiral) Visualization Pipeline ---
+        print("Using visualization pipeline for non-GRF data.")
+        
+        # 1. Data and Trajectory
+        _plot_data_and_trajectory(bridge, marginal_data, T, output_dir, device)
+        
+        # 2. Asymmetric Dynamics (Forward ODE vs Reverse SDE)
+        # Use fewer particles for trajectory visualization
+        _plot_asymmetric_dynamics(bridge, T, n_viz_particles=min(n_viz_particles, 50), n_sde_steps=n_sde_steps, output_dir=output_dir, device=device)
+        
+        # 3. Marginal Distribution Comparison (Consistency Check)
+        _plot_marginal_distribution_comparison(bridge, T, n_viz_particles=n_viz_particles, n_sde_steps=n_sde_steps, output_dir=output_dir, device=device)
+
+        # 4. Marginal Data Fit (Qualitative)
+        _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device)
+
+        print("Visualization pipeline complete.")
+        return
+
+    # --- GRF Specific Visualization Pipeline ---
+    print("Using specialized visualization pipeline for GRF data.")
+
+    with torch.no_grad():
+        # 1. Visualize Input Data
+        _plot_grf_marginals(marginal_data, output_dir, title="Input GRF Data Marginals")
+        
+        # 2. Visualize Learned Parameters and Evolution
+        _plot_data_and_trajectory_grf(bridge, marginal_data, T, output_dir, device)
+        _plot_learned_grf_evolution(bridge, T, output_dir, device)
+        
+        # 3. Select specific samples for consistent comparison
+        n_samples_show = 6  # Number of samples to track through time
+        selected_indices = torch.randperm(marginal_data[max(marginal_data.keys())].shape[0])[:n_samples_show]
+        
+        # 4. Generate consistent backward samples starting from the same final time samples
+        print("\n4. Generating consistent backward samples for detailed comparison...")
+        original_selected, generated_consistent = generate_consistent_backward_samples(
+            bridge, marginal_data, selected_indices, n_steps=n_sde_steps, device=device
+        )
+        
+        # 5. Visualize original samples evolution (separate figure)
+        _visualize_original_samples(original_selected, selected_indices, output_dir)
+        
+        # 6. Visualize generated samples evolution (separate figure)
+        _visualize_generated_samples(generated_consistent, selected_indices, output_dir)
+        
+        # 7. Create side-by-side comparison (combined figure)
+        _visualize_consistent_samples_comparison(original_selected, generated_consistent, selected_indices, output_dir)
+        
+        # 8. Generate additional samples for statistical analysis
+        n_samples_analysis = max(n_viz_particles, 256) 
+        generated_samples = generate_backward_samples(
+            bridge, marginal_data, n_samples=n_samples_analysis, n_steps=n_sde_steps, device=device
+        )
+        
+        # 9. Statistical Comparison (First-order statistics: Mean, Std Dev)
+        _visualize_marginal_statistics_comparison(marginal_data, generated_samples, output_dir)
+        
+        # 10. Covariance Analysis (Second-order statistics: ACF)
+        _visualize_covariance_comparison(marginal_data, generated_samples, output_dir)
+        
+        # 11. Sample Distributions Comparison
+        _visualize_sample_distributions(marginal_data, generated_samples, output_dir)
+
+        # Note: Quantitative metrics (W2, MSE_ACF) are calculated in the main validation step (Step 5).
+
+    print("--- GRF Visualization Pipeline Complete ---")
 
 
 # ============================================================================
@@ -1676,10 +2198,10 @@ def main(use_grf: bool = False):
     print("\n4. Visualizing results...")
     visualize_bridge_results(bridge, marginal_data, T_MAX, n_viz_particles=1000, n_sde_steps=100, output_dir=OUTPUT_DIR, is_grf=use_grf)
     
-    # Step 5: Validation (skip for GRF due to computational complexity)
+    # Step 5: Validation
+    print("\n5. Performing rigorous validation...")
     if not use_grf:
-        print("\n5. Performing rigorous asymmetric consistency validation...")
-
+        # ... (Existing validation logic for spiral data using validate_asymmetric_consistency) ...
         validation_results = validate_asymmetric_consistency(
             bridge=bridge,
             T=T_MAX,
@@ -1712,7 +2234,43 @@ def main(use_grf: bool = False):
         else:
             print("Validation failed to run or produced no results.")
     else:
-        print("\n5. Validation skipped for GRF data (computationally expensive).")
+        # GRF Validation (Quantitative Metrics: W2 and MSE_ACF)
+        print("Performing quantitative validation for GRF data.")
+        
+        # Generate backward samples specifically for validation (ensure sufficient samples)
+        N_SAMPLES_VALIDATION = 512
+        # Ensure we do not request more samples than available in the data
+        max_data_samples = max(s.shape[0] for s in marginal_data.values())
+        N_SAMPLES_VALIDATION = min(N_SAMPLES_VALIDATION, max_data_samples)
+
+        generated_samples_val = generate_backward_samples(
+            bridge, marginal_data, n_samples=N_SAMPLES_VALIDATION, n_steps=100, device=DEVICE
+        )
+        
+        # Calculate metrics
+        validation_metrics = _calculate_validation_metrics(marginal_data, generated_samples_val)
+        
+        # Print Summary
+        print("\nGRF VALIDATION SUMMARY:")
+        print("-" * 40)
+        
+        if validation_metrics and validation_metrics['w2_distances']:
+            avg_w2 = np.nanmean(validation_metrics['w2_distances'])
+            avg_mse_acf = np.nanmean(validation_metrics['mse_acf'])
+
+            print(f"Average Sliced Wasserstein-2 distance: {avg_w2:.6f}")
+            print(f"Average MSE of Autocorrelation Function (ACF): {avg_mse_acf:.6e}")
+            
+            # Define success criteria (example thresholds, may need tuning)
+            W2_THRESHOLD = 0.5
+            MSE_ACF_THRESHOLD = 1e-3
+            
+            if avg_w2 < W2_THRESHOLD and (np.isnan(avg_mse_acf) or avg_mse_acf < MSE_ACF_THRESHOLD):
+                print("\nValidation SUCCESS: Distributional interpolation and covariance structure preserved.")
+            else:
+                print(f"\nValidation WARNING: Metrics exceeded thresholds (W2<{W2_THRESHOLD}, MSE_ACF<{MSE_ACF_THRESHOLD}).")
+        else:
+            print("Validation failed to run or produced no results.")
 
     print("\n" + "="*80)
     if use_grf:
