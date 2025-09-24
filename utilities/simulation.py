@@ -49,8 +49,8 @@ def solve_gaussian_bridge_reverse_sde(
     for i in range(n_steps):
         t, t_next = tt[i], tt[i+1]
 
-        t_tensor = torch.tensor([[float(t)]], device=device, requires_grad=torch.is_grad_enabled())
-        t_next_tensor = torch.tensor([[float(t_next)]], device=device, requires_grad=torch.is_grad_enabled())
+        t_tensor = torch.tensor([[float(t)]], device=device, dtype=torch.float32, requires_grad=torch.is_grad_enabled())
+        t_next_tensor = torch.tensor([[float(t_next)]], device=device, dtype=torch.float32, requires_grad=torch.is_grad_enabled())
 
         with torch.set_grad_enabled(torch.is_grad_enabled()):
             mu_t_scalar, gamma_t_scalar, _, dgamma_dt_scalar = bridge.get_params_and_derivs(t_tensor)
@@ -163,7 +163,6 @@ def generate_backward_samples(
     
     bridge.eval()
     generated_samples = {}
-    T = bridge.T
     
     sorted_times = sorted(marginal_data.keys())
     
