@@ -20,4 +20,4 @@ def jvp(f: Callable[[Tensor], Any], x: Tensor, v: Tensor) -> Tuple[Tensor, ...]:
 
 def t_dir(f: Callable[[Tensor], Any], t: Tensor) -> Tuple[Tensor, ...]:
     """Compute the time derivative of f(t) by using jvp with v=1."""
-    return jvp(f, t, torch.ones_like(t))
+    return jvp(f, t, torch.ones_like(t)) # returns a tuple of (f(t), jvp)
