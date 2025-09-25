@@ -23,6 +23,25 @@ from .simulation import solve_gaussian_bridge_reverse_sde, solve_backward_sde_eu
 from .validation import compute_sample_covariance_matrix, relative_covariance_frobenius_distance
 
 # ============================================================================
+# Paper Formatting
+# ============================================================================
+
+def format_for_paper():
+    """Standard formatting for publication-ready figures."""
+    plt.rcParams.update({'image.cmap': 'viridis'})
+    plt.rcParams.update({'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif',
+                                        'Bitstream Vera Serif', 'Computer Modern Roman', 'New Century Schoolbook',
+                                        'Century Schoolbook L',  'Utopia', 'ITC Bookman', 'Bookman',
+                                        'Nimbus Roman No9 L', 'Palatino', 'Charter', 'serif']})
+    plt.rcParams.update({'font.family': 'serif'})
+    plt.rcParams.update({'font.size': 10})
+    plt.rcParams.update({'mathtext.fontset': 'custom'})
+    plt.rcParams.update({'mathtext.rm': 'serif'})
+    plt.rcParams.update({'mathtext.it': 'serif:italic'})
+    plt.rcParams.update({'mathtext.bf': 'serif:bold'})
+    plt.close('all')
+
+# ============================================================================
 # Plotting Helpers
 # ============================================================================
 
@@ -48,6 +67,7 @@ def plot_confidence_ellipse(ax, mu, cov, n_std=2.0, **kwargs):
 def _plot_marginal_distribution_comparison(
     bridge, T, n_viz_particles, n_sde_steps, output_dir, device, solver=None
 ):
+    format_for_paper()
     print("  - Plotting marginal distribution comparisons...")
     validation_times = [T * f for f in [0.25, 0.5, 0.75]]
 
@@ -82,8 +102,8 @@ def _plot_marginal_distribution_comparison(
         solver = solve_gaussian_bridge_reverse_sde
     reverse_path = solver(bridge, zT, T, 0.0, n_sde_steps).cpu()
 
-    fig, axes = plt.subplots(2, len(validation_times), figsize=(6 * len(validation_times), 11), sharex=True, sharey=True)
-    fig.suptitle("Figure 3: Comparison of Marginal Distributions p_t(z)", fontsize=16)
+    fig, axes = plt.subplots(2, len(validation_times), figsize=(12, 8), sharex=True, sharey=True)
+    fig.suptitle("Comparison of Marginal Distributions p_t(z)", fontsize=12)
 
     for i, t_val in enumerate(validation_times):
         ax_scatter = axes[0, i]
@@ -158,13 +178,14 @@ def _plot_marginal_distribution_comparison(
         ax_contour.grid(True, linestyle=':')
         ax_contour.set_aspect('equal', adjustable='box')
     
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(output_dir, "fig3_marginal_comparison.png"), dpi=300)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fig3_marginal_comparison.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
 def _plot_grf_marginals(marginal_data, output_dir, title="GRF Data Marginals"):
     """Visualizes samples from the GRF marginal data."""
+    format_for_paper()
     print(f"  - Plotting {title}...")
     
     sorted_times = sorted(marginal_data.keys())
@@ -180,7 +201,7 @@ def _plot_grf_marginals(marginal_data, output_dir, title="GRF Data Marginals"):
         print(f"Warning: Data dimension {data_dim} is not a perfect square.")
         return
 
-    fig, axes = plt.subplots(n_samples_to_show, n_marginals, figsize=(3 * n_marginals, 3 * n_samples_to_show))
+    fig, axes = plt.subplots(n_samples_to_show, n_marginals, figsize=(min(12, 3 * n_marginals), min(10, 2.5 * n_samples_to_show)))
     if axes.ndim == 1:
         axes = np.array([axes])
     
@@ -278,22 +299,21 @@ def _visualize_comparative_backward_samples(
             if j == 0:
                 axes[row_gt, j].set_ylabel(f'GT-Backward {i+1}', rotation=90, labelpad=15)
     
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "comparative_backward_samples.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
-def _visualize_backward_samples_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
+def _visualize_ground_truth_samples(marginal_data: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
     """
-    Visualize comparison between original marginal data and backward generated samples.
-    Shows multiple samples side by side for qualitative assessment.
-    Uses consistent sample selection to track the same samples across time points.
+    Visualize ground truth marginal data samples across time points.
     """
-    print("  - Plotting backward samples vs marginal data comparison...")
+    format_for_paper()
+    print("  - Plotting ground truth samples...")
     
     sorted_times = sorted(marginal_data.keys())
     n_time_points = len(sorted_times)
-    n_samples_show = 4
+    n_samples_show = 3  # Reduced number of samples for cleaner visualization
     
     if not sorted_times:
         return
@@ -309,59 +329,132 @@ def _visualize_backward_samples_comparison(marginal_data: Dict[float, Tensor], g
         selected_indices = sample_indices
         n_samples_show = len(selected_indices)
     else:
-        # Fallback: Select consistent sample indices from the final time point
         final_time = max(sorted_times)
-        n_available_samples = min(marginal_data[final_time].shape[0], generated_samples[final_time].shape[0])
+        n_available_samples = marginal_data[final_time].shape[0]
         n_samples_show = min(n_samples_show, n_available_samples)
         selected_indices = torch.randperm(n_available_samples)[:n_samples_show]
 
-    fig, axes = plt.subplots(2 * n_samples_show, n_time_points, 
-                           figsize=(3 * n_time_points, 3 * 2 * n_samples_show))
-    fig.suptitle("Backward Generated Samples vs Original Marginal Data (Consistent Samples)", fontsize=16)
+    # Create compact figure for ground truth samples
+    fig, axes = plt.subplots(n_samples_show, n_time_points, figsize=(min(10, 2.5 * n_time_points), min(6, 2 * n_samples_show)))
+    if n_samples_show == 1 or n_time_points == 1:
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+        if n_samples_show > 1:
+            axes = axes.reshape(-1, 1)
+        elif n_time_points > 1:
+            axes = axes.reshape(1, -1)
     
-    if axes.ndim == 1:
-        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
+    fig.suptitle("Ground Truth Samples Evolution", fontsize=12)
     
-    all_original = torch.cat([marginal_data[t] for t in sorted_times], dim=0).cpu().numpy()
-    all_generated = torch.cat([generated_samples[t] for t in sorted_times], dim=0).cpu().numpy()
-    vmin = min(all_original.min(), all_generated.min())
-    vmax = max(all_original.max(), all_generated.max())
+    # Determine global color scale
+    all_data = torch.cat([marginal_data[t] for t in sorted_times], dim=0).cpu().numpy()
+    vmin, vmax = all_data.min(), all_data.max()
     
     for j, t_val in enumerate(sorted_times):
-        original_data = marginal_data[t_val].cpu().numpy()
-        generated_data = generated_samples[t_val].cpu().numpy()
+        data = marginal_data[t_val].cpu().numpy()
         
         for i in range(n_samples_show):
-            # Use consistent sample indices
             sample_idx = selected_indices[i].item()
+            ax = axes[i, j] if axes.ndim == 2 else axes[max(i, j)]
             
-            row_orig = 2 * i
-            if sample_idx < original_data.shape[0]:
-                sample_orig = original_data[sample_idx].reshape(resolution, resolution)
-                axes[row_orig, j].imshow(sample_orig, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
-            axes[row_orig, j].axis('off')
+            if sample_idx < data.shape[0]:
+                sample = data[sample_idx].reshape(resolution, resolution)
+                ax.imshow(sample, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            ax.axis('off')
+            
             if j == 0:
-                axes[row_orig, j].set_ylabel(f'Original {i+1}', rotation=0, ha='right', va='center')
+                ax.set_ylabel(f'Sample {i+1}', rotation=90, labelpad=15)
             if i == 0:
-                axes[row_orig, j].set_title(f't = {t_val:.2f}')
-            
-            row_gen = 2 * i + 1
-            if sample_idx < generated_data.shape[0]:
-                sample_gen = generated_data[sample_idx].reshape(resolution, resolution)
-                axes[row_gen, j].imshow(sample_gen, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
-            axes[row_gen, j].axis('off')
-            if j == 0:
-                axes[row_gen, j].set_ylabel(f'Generated {i+1}', rotation=0, ha='right', va='center')
+                ax.set_title(f't = {t_val:.2f}')
     
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    plt.savefig(os.path.join(output_dir, "backward_samples_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "ground_truth_samples_evolution.png"), dpi=300, bbox_inches='tight')
     plt.close()
+
+
+def _visualize_generated_backward_samples(generated_samples: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
+    """
+    Visualize generated backward samples across time points.
+    """
+    format_for_paper()
+    print("  - Plotting generated backward samples...")
+    
+    sorted_times = sorted(generated_samples.keys())
+    n_time_points = len(sorted_times)
+    n_samples_show = 3  # Reduced number of samples for cleaner visualization
+    
+    if not sorted_times:
+        return
+    data_dim = generated_samples[sorted_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    
+    if resolution * resolution != data_dim:
+        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
+        return
+
+    # Use provided sample indices or generate consistent ones
+    if sample_indices is not None:
+        selected_indices = sample_indices
+        n_samples_show = len(selected_indices)
+    else:
+        final_time = max(sorted_times)
+        n_available_samples = generated_samples[final_time].shape[0]
+        n_samples_show = min(n_samples_show, n_available_samples)
+        selected_indices = torch.randperm(n_available_samples)[:n_samples_show]
+
+    # Create compact figure for generated samples
+    fig, axes = plt.subplots(n_samples_show, n_time_points, figsize=(min(10, 2.5 * n_time_points), min(6, 2 * n_samples_show)))
+    if n_samples_show == 1 or n_time_points == 1:
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+        if n_samples_show > 1:
+            axes = axes.reshape(-1, 1)
+        elif n_time_points > 1:
+            axes = axes.reshape(1, -1)
+    
+    fig.suptitle("Generated Backward Samples Evolution", fontsize=12)
+    
+    # Determine global color scale
+    all_data = torch.cat([generated_samples[t] for t in sorted_times], dim=0).cpu().numpy()
+    vmin, vmax = all_data.min(), all_data.max()
+    
+    for j, t_val in enumerate(sorted_times):
+        data = generated_samples[t_val].cpu().numpy()
+        
+        for i in range(n_samples_show):
+            sample_idx = selected_indices[i].item()
+            ax = axes[i, j] if axes.ndim == 2 else axes[max(i, j)]
+            
+            if sample_idx < data.shape[0]:
+                sample = data[sample_idx].reshape(resolution, resolution)
+                ax.imshow(sample, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
+            ax.axis('off')
+            
+            if j == 0:
+                ax.set_ylabel(f'Sample {i+1}', rotation=90, labelpad=15)
+            if i == 0:
+                ax.set_title(f't = {t_val:.2f}')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "generated_backward_samples_evolution.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _visualize_backward_samples_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
+    """
+    Wrapper function to generate both ground truth and generated backward samples visualizations.
+    Creates separate, cleaner figures for better readability.
+    """
+    # Create separate visualizations for better readability
+    _visualize_ground_truth_samples(marginal_data, output_dir, sample_indices)
+    _visualize_generated_backward_samples(generated_samples, output_dir, sample_indices)
 
 
 def _visualize_marginal_statistics_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
     """
     Compare statistical properties (mean, std, distribution) between original and generated samples.
     """
+    format_for_paper()
     print("  - Plotting marginal statistics comparison...")
     
     sorted_times = sorted(marginal_data.keys())
@@ -430,13 +523,14 @@ def _visualize_sample_distributions(marginal_data: Dict[float, Tensor], generate
     """
     Visualize the pixel-wise distributions for select time points to assess distributional match.
     """
+    format_for_paper()
     print("  - Plotting sample distributions comparison...")
     
     sorted_times = sorted(marginal_data.keys())
     n_plots = min(4, len(sorted_times))
     selected_times = [sorted_times[i] for i in np.linspace(0, len(sorted_times)-1, n_plots, dtype=int)]
     
-    fig, axes = plt.subplots(2, n_plots, figsize=(4 * n_plots, 8))
+    fig, axes = plt.subplots(2, n_plots, figsize=(min(12, 3.5 * n_plots), 7))
     if n_plots == 1:
         axes = axes.reshape(-1, 1)
     fig.suptitle("Pixel Value Distributions: Original vs Generated", fontsize=14)
@@ -481,19 +575,15 @@ def _visualize_sample_distributions(marginal_data: Dict[float, Tensor], generate
     plt.close()
 
 
-def _visualize_statistical_covariance_comparison(
+def _visualize_variance_fields_comparison(
     marginal_data: Dict[float, Tensor], 
     generated_samples: Dict[float, Tensor], 
-    output_dir: str,
-    max_dim_for_heatmap: int = 2048
+    output_dir: str
 ):
-    """
-    Visualizes and compares covariance statistics, saving THREE separate figures:
-    1) Variance fields (target as color, generated as contours)
-    2) Eigenvalue spectra
-    3) Covariance heatmaps (target, generated, difference) [optional]
-    """
-    print("  - Plotting statistical covariance comparison (3 figures)...")
+    """Visualizes variance field comparison between original and generated samples."""
+    format_for_paper()
+    print("  - Plotting variance fields comparison...")
+    
     sorted_times = sorted(marginal_data.keys())
     if not sorted_times:
         return
@@ -506,19 +596,12 @@ def _visualize_statistical_covariance_comparison(
     resolution = int(math.sqrt(data_dim))
     is_square = (resolution * resolution == data_dim)
 
-    visualize_heatmaps = (data_dim <= max_dim_for_heatmap)
-
-    global_vmax_cov = 0
-    global_vmax_diff = 0
     cov_data_list, cov_gen_list, metrics = [], [], {}
 
     for t_val in selected_times:
         samples_data = marginal_data[t_val].cpu()
         samples_gen = generated_samples[t_val].cpu()
-        N_samples = min(samples_data.shape[0], samples_gen.shape[0])
-        if N_samples < data_dim:
-            print(f"    CRITICAL Warning: Insufficient samples (N={N_samples}) relative to D={data_dim} at t={t_val:.2f}. Estimates may be rank-deficient.")
-
+        
         cov_data = compute_sample_covariance_matrix(samples_data)
         cov_gen = compute_sample_covariance_matrix(samples_gen)
         cov_data_list.append(cov_data)
@@ -527,18 +610,11 @@ def _visualize_statistical_covariance_comparison(
         rel_f_dist = relative_covariance_frobenius_distance(cov_data, cov_gen)
         metrics[t_val] = {'Rel_F_dist': rel_f_dist}
 
-        if visualize_heatmaps:
-            max_abs_val = max(torch.abs(cov_data).max().item(), torch.abs(cov_gen).max().item())
-            global_vmax_cov = max(global_vmax_cov, max_abs_val)
-            diff = cov_data - cov_gen
-            global_vmax_diff = max(global_vmax_diff, torch.abs(diff).max().item())
-
-    # ---------------------------- Figure 1: Variance Fields ----------------------------
-    # Create a figure with 2 rows (Target, Generated) and n_time_points columns
-    fig_var, axes_var = plt.subplots(2, n_time_points, figsize=(6 * n_time_points, 9), sharex=True, sharey=True)
+    # Create variance fields figure - reasonable paper size
+    fig_var, axes_var = plt.subplots(2, n_time_points, figsize=(10, 6), sharex=True, sharey=True)
     if n_time_points == 1:
         axes_var = axes_var.reshape(2, 1)
-    fig_var.suptitle("Variance Field Comparison", fontsize=16)
+    fig_var.suptitle("Variance Field Comparison", fontsize=12)
 
     # Compute a global max variance across all times for consistent scale
     if is_square:
@@ -546,14 +622,11 @@ def _visualize_statistical_covariance_comparison(
     else:
         max_var = None
 
-    im_data = None  # keep reference to the last image mappable for a single shared colorbar
-
     for i, t_val in enumerate(selected_times):
         cov_data = cov_data_list[i]
         cov_gen = cov_gen_list[i]
         var_data = torch.diag(cov_data)
         var_gen = torch.diag(cov_gen)
-        title_str = f"t={t_val:.2f} (Rel F-Dist={metrics[t_val]['Rel_F_dist']:.3f})"
         
         ax_target = axes_var[0, i]
         ax_gen = axes_var[1, i]
@@ -561,11 +634,15 @@ def _visualize_statistical_covariance_comparison(
         if is_square:
             # Plot Target Variance (Top Row)
             arr_data = var_data.reshape(resolution, resolution).numpy()
-            im_data = ax_target.imshow(arr_data, cmap='plasma', vmin=0, vmax=max_var)
+            im_target = ax_target.imshow(arr_data, cmap='plasma', vmin=0, vmax=max_var)
             
             # Plot Generated Variance (Bottom Row)
             arr_gen = var_gen.reshape(resolution, resolution).numpy()
-            ax_gen.imshow(arr_gen, cmap='plasma', vmin=0, vmax=max_var)
+            im_gen = ax_gen.imshow(arr_gen, cmap='plasma', vmin=0, vmax=max_var)
+            
+            # Add individual colorbars for each image
+            plt.colorbar(im_target, ax=ax_target, fraction=0.046, pad=0.04)
+            plt.colorbar(im_gen, ax=ax_gen, fraction=0.046, pad=0.04)
 
         else: # 1D data case
             ax_target.plot(var_data.numpy(), label='Target')
@@ -577,32 +654,45 @@ def _visualize_statistical_covariance_comparison(
 
         # Set titles and labels
         if i == 0:
-            ax_target.set_ylabel("Target Variance")
-            ax_gen.set_ylabel("Generated Variance")
-        ax_target.set_title(title_str)
+            ax_target.set_ylabel("Target")
+            ax_gen.set_ylabel("Generated")
+        ax_target.set_title(f"t = {t_val:.2f}\nRel F-Dist = {metrics[t_val]['Rel_F_dist']:.3f}")
 
-
-    # If square fields were plotted, place a single shared colorbar to the right
-    if is_square and im_data is not None:
-        fig_var.subplots_adjust(right=0.85)
-        cax = fig_var.add_axes([0.88, 0.15, 0.04, 0.7])
-        fig_var.colorbar(im_data, cax=cax, label="Variance")
-
-    plt.tight_layout(rect=[0, 0.03, 0.85, 0.95])
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, "statistical_covariance_variance_fields.png"), dpi=300)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "statistical_covariance_variance_fields.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_var)
 
 
-    # ------------------------- Figure 2: Eigenvalue Spectra -------------------------
-    fig_eig, axes_eig = plt.subplots(1, n_time_points, figsize=(6 * n_time_points, 5))
+def _visualize_eigenvalue_spectra_comparison(
+    marginal_data: Dict[float, Tensor], 
+    generated_samples: Dict[float, Tensor], 
+    output_dir: str
+):
+    """Visualizes eigenvalue spectra comparison between original and generated samples."""
+    format_for_paper()
+    print("  - Plotting eigenvalue spectra comparison...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    if not sorted_times:
+        return
+
+    n_time_points = min(3, len(sorted_times))
+    selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
+    selected_times = [sorted_times[i] for i in selected_indices]
+
+    # Create eigenvalue spectra figure - reasonable paper size
+    fig_eig, axes_eig = plt.subplots(1, n_time_points, figsize=(12, 4))
     if n_time_points == 1:
-        axes_eig = np.array([axes_eig])
-    fig_eig.suptitle("Eigenvalue Spectrum Comparison", fontsize=16)
+        axes_eig = [axes_eig]
+    fig_eig.suptitle("Eigenvalue Spectrum Comparison", fontsize=12)
 
     for i, t_val in enumerate(selected_times):
-        cov_data = cov_data_list[i]
-        cov_gen = cov_gen_list[i]
+        samples_data = marginal_data[t_val].cpu()
+        samples_gen = generated_samples[t_val].cpu()
+        
+        cov_data = compute_sample_covariance_matrix(samples_data)
+        cov_gen = compute_sample_covariance_matrix(samples_gen)
+        
         ax_eig = axes_eig[i]
         try:
             eigvals_data = torch.linalg.eigvalsh(cov_data.double())
@@ -611,90 +701,136 @@ def _visualize_statistical_covariance_comparison(
             eigvals_gen = torch.sort(eigvals_gen, descending=True)[0].float()
             eigvals_data = torch.clamp(eigvals_data, min=1e-12)
             eigvals_gen = torch.clamp(eigvals_gen, min=1e-12)
-            ax_eig.loglog(eigvals_data.numpy(), 'b-', label='Target')
-            ax_eig.loglog(eigvals_gen.numpy(), 'r--', label='Generated')
-            ax_eig.set_title(f"t={t_val:.2f}")
+            
+            ax_eig.loglog(eigvals_data.numpy(), 'b-', label='Target', linewidth=2)
+            ax_eig.loglog(eigvals_gen.numpy(), 'r--', label='Generated', linewidth=2)
+            ax_eig.set_title(f"t = {t_val:.2f}")
             ax_eig.set_xlabel("Mode Index")
             if i == 0:
-                ax_eig.set_ylabel("Eigenvalue (Log-Log)")
+                ax_eig.set_ylabel("Eigenvalue")
                 ax_eig.legend()
             ax_eig.grid(True, which="both", ls="--", alpha=0.3)
         except Exception as e:
             print(f"    Warning: Eigenvalue computation failed at t={t_val:.2f}: {e}")
-            ax_eig.text(0.5, 0.5, "Eig computation failed", ha='center', va='center')
+            ax_eig.text(0.5, 0.5, "Eigenvalue\ncomputation failed", ha='center', va='center', transform=ax_eig.transAxes)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(output_dir, "statistical_covariance_eigen_spectrum.png"), dpi=300)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "statistical_covariance_eigen_spectrum.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_eig)
 
-    # ---------------------- Figure 3: Covariance Heatmaps (opt) ----------------------
-    if visualize_heatmaps:
-        cmap_cov = 'coolwarm'
-        cmap_diff = 'RdBu_r'
-        fig_hm, axes_hm = plt.subplots(3, n_time_points, figsize=(4 * n_time_points, 12))
-        if n_time_points == 1:
-            axes_hm = axes_hm.reshape(3, 1)
-        fig_hm.suptitle("Covariance Heatmaps (Target, Generated, Difference)", fontsize=16)
 
-        im_target = None
-        im_diff = None
+def _visualize_covariance_heatmaps_comparison(
+    marginal_data: Dict[float, Tensor], 
+    generated_samples: Dict[float, Tensor], 
+    output_dir: str,
+    max_dim_for_heatmap: int = 2048
+):
+    """Visualizes covariance heatmaps comparison between original and generated samples."""
+    format_for_paper()
+    print("  - Plotting covariance heatmaps comparison...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    if not sorted_times:
+        return
 
-        for i, t_val in enumerate(selected_times):
-            cov_data = cov_data_list[i]
-            cov_gen = cov_gen_list[i]
+    data_dim = marginal_data[sorted_times[0]].shape[1]
+    if data_dim > max_dim_for_heatmap:
+        print(f"    Skipping heatmaps: dimension {data_dim} > {max_dim_for_heatmap}")
+        return
 
-            ax_t = axes_hm[0, i]
-            im_target = ax_t.imshow(cov_data.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
-            ax_t.set_title(f"t={t_val:.2f} Target")
-            if i == 0:
-                ax_t.set_ylabel("Target")
+    n_time_points = min(3, len(sorted_times))
+    selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
+    selected_times = [sorted_times[i] for i in selected_indices]
 
-            ax_g = axes_hm[1, i]
-            ax_g.imshow(cov_gen.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
-            ax_g.set_title("Generated")
-            if i == 0:
-                ax_g.set_ylabel("Generated")
+    global_vmax_cov = 0
+    global_vmax_diff = 0
+    cov_data_list, cov_gen_list = [], []
 
-            ax_d = axes_hm[2, i]
-            diff = cov_data - cov_gen
-            im_diff = ax_d.imshow(diff.numpy(), cmap=cmap_diff, vmin=-global_vmax_diff, vmax=global_vmax_diff)
-            ax_d.set_title("Difference")
-            if i == 0:
-                ax_d.set_ylabel("Difference")
+    for t_val in selected_times:
+        samples_data = marginal_data[t_val].cpu()
+        samples_gen = generated_samples[t_val].cpu()
+        
+        cov_data = compute_sample_covariance_matrix(samples_data)
+        cov_gen = compute_sample_covariance_matrix(samples_gen)
+        cov_data_list.append(cov_data)
+        cov_gen_list.append(cov_gen)
 
-        # Reserve space on the right for two colorbars and avoid overlap with subplots
-        fig_hm.subplots_adjust(right=0.82, hspace=0.35, wspace=0.3)
+        max_abs_val = max(torch.abs(cov_data).max().item(), torch.abs(cov_gen).max().item())
+        global_vmax_cov = max(global_vmax_cov, max_abs_val)
+        diff = cov_data - cov_gen
+        global_vmax_diff = max(global_vmax_diff, torch.abs(diff).max().item())
 
-        # Add two dedicated colorbar axes on the right of the figure with controlled placement:
-        # - cax_cov spans approximately the vertical space of the top two rows (Target + Generated)
-        # - cax_diff sits below it aligned to the bottom row (Difference)
-        cax_cov = fig_hm.add_axes([0.85, 0.35, 0.03, 0.52])   # [left, bottom, width, height]
-        cax_diff = fig_hm.add_axes([0.85, 0.08, 0.03, 0.22])
+    # Create covariance heatmaps figure - reasonable paper size
+    cmap_cov = 'coolwarm'
+    cmap_diff = 'RdBu_r'
+    fig_hm, axes_hm = plt.subplots(3, n_time_points, figsize=(10, 8))
+    if n_time_points == 1:
+        axes_hm = axes_hm.reshape(3, 1)
+    fig_hm.suptitle("Covariance Matrix Heatmaps", fontsize=12)
 
-        # Attach colorbars to the corresponding mappable objects
-        if im_target is not None:
-            fig_hm.colorbar(im_target, cax=cax_cov, label="Covariance")
-        if im_diff is not None:
-            fig_hm.colorbar(im_diff, cax=cax_diff, label="Difference")
+    for i, t_val in enumerate(selected_times):
+        cov_data = cov_data_list[i]
+        cov_gen = cov_gen_list[i]
 
-        # Final layout adjustments and save
-        plt.tight_layout(rect=[0, 0.03, 0.84, 0.95])
-        plt.savefig(os.path.join(output_dir, "statistical_covariance_heatmaps.png"), dpi=300)
-        plt.close(fig_hm)
+        ax_t = axes_hm[0, i]
+        im_target = ax_t.imshow(cov_data.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
+        ax_t.set_title(f"Target\nt = {t_val:.2f}")
+        if i == 0:
+            ax_t.set_ylabel("Target")
+
+        ax_g = axes_hm[1, i]
+        im_gen = ax_g.imshow(cov_gen.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
+        ax_g.set_title("Generated")
+        if i == 0:
+            ax_g.set_ylabel("Generated")
+
+        ax_d = axes_hm[2, i]
+        diff = cov_data - cov_gen
+        im_diff = ax_d.imshow(diff.numpy(), cmap=cmap_diff, vmin=-global_vmax_diff, vmax=global_vmax_diff)
+        ax_d.set_title("Difference")
+        if i == 0:
+            ax_d.set_ylabel("Difference")
+            
+        # Add individual colorbars for each heatmap
+        plt.colorbar(im_target, ax=ax_t, fraction=0.046, pad=0.04)
+        plt.colorbar(im_gen, ax=ax_g, fraction=0.046, pad=0.04)
+        plt.colorbar(im_diff, ax=ax_d, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "statistical_covariance_heatmaps.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig_hm)
+
+
+def _visualize_statistical_covariance_comparison(
+    marginal_data: Dict[float, Tensor], 
+    generated_samples: Dict[float, Tensor], 
+    output_dir: str,
+    max_dim_for_heatmap: int = 2048
+):
+    """
+    Wrapper function to generate separate statistical covariance comparison figures:
+    1) Variance fields comparison
+    2) Eigenvalue spectra comparison  
+    3) Covariance heatmaps comparison (optional)
+    """
+    _visualize_variance_fields_comparison(marginal_data, generated_samples, output_dir)
+    _visualize_eigenvalue_spectra_comparison(marginal_data, generated_samples, output_dir)
+    _visualize_covariance_heatmaps_comparison(marginal_data, generated_samples, output_dir, max_dim_for_heatmap)
 
 
 def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
     """Plot marginal data fit comparison."""
+    format_for_paper()
     print("  - Plotting marginal data fit...")
 
     sorted_times = sorted(marginal_data.keys())
     n_marginals = len(sorted_times)
 
-    fig, axes = plt.subplots(2, n_marginals, figsize=(6 * n_marginals, 11), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, n_marginals, figsize=(min(12, 4 * n_marginals), 8), sharex=True, sharey=True)
     if n_marginals == 1:
         axes = np.array([[axes[0]], [axes[1]]])
 
-    fig.suptitle("Figure 4: Qualitative Fit to Marginal Data Constraints", fontsize=16)
+    fig.suptitle("Qualitative Fit to Marginal Data Constraints", fontsize=12)
 
     for i, t_k in enumerate(sorted_times):
         ax_scatter = axes[0, i]
@@ -773,12 +909,12 @@ def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
         ax_contour.grid(True, linestyle=':')
         ax_contour.set_aspect('equal', adjustable='box')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(output_dir, "fig4_marginal_fit.png"), dpi=300)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fig4_marginal_fit.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
 
-def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: float, output_dir: str, is_grf: bool = False, n_viz_particles: int = 50, n_sde_steps: int = 100, solver: str = 'euler'):
+def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: float, output_dir: str, is_grf: bool = False, n_viz_particles: int = 50, n_sde_steps: int = 100, solver: str = 'euler', enable_covariance_analysis: bool = True):
     """
     Generate and save a comprehensive set of visualizations for the trained bridge.
     """
@@ -862,8 +998,11 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
             generated_full_cpu = {t: bridge.denormalize(generated_full[t].cpu()) for t in sorted(generated_full.keys())}
 
             # Covariance comparisons (ACF + full statistical covariance) with full batches
-            _visualize_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
-            _visualize_statistical_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
+            if enable_covariance_analysis:
+                _visualize_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
+                _visualize_statistical_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
+            else:
+                print("Skipping covariance visualizations (enable_covariance_analysis=False).")
             
         else:
             # ... standard spiral data visualizations
@@ -879,6 +1018,7 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
 
 def _plot_grf_marginals(marginal_data, output_dir, title="GRF Data Marginals"):
     """Visualizes samples from the GRF marginal data."""
+    format_for_paper()
     print(f"  - Plotting {title}...")
     
     sorted_times = sorted(marginal_data.keys())
@@ -933,88 +1073,19 @@ def _plot_grf_marginals(marginal_data, output_dir, title="GRF Data Marginals"):
 
 def _visualize_backward_samples_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
     """
-    Visualize comparison between original marginal data and backward generated samples.
-    Uses consistent sample selection to track the same samples across time points.
+    Wrapper function to generate both ground truth and generated backward samples visualizations.
+    Creates separate, cleaner figures for better readability.
     """
-    print("  - Plotting backward samples vs marginal data comparison...")
-    
-    sorted_times = sorted(marginal_data.keys())
-    n_time_points = len(sorted_times)
-    n_samples_show = 4
-    
-    # Determine resolution
-    if not sorted_times:
-        return
-    data_dim = marginal_data[sorted_times[0]].shape[1]
-    resolution = int(math.sqrt(data_dim))
-    
-    if resolution * resolution != data_dim:
-        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
-        return
-
-    # Use provided sample indices or generate consistent ones
-    if sample_indices is not None:
-        selected_indices = sample_indices
-        n_samples_show = len(selected_indices)
-    else:
-        # Fallback: Select consistent sample indices from the final time point
-        final_time = max(sorted_times)
-        n_available_samples = min(marginal_data[final_time].shape[0], generated_samples[final_time].shape[0])
-        n_samples_show = min(n_samples_show, n_available_samples)
-        selected_indices = torch.randperm(n_available_samples)[:n_samples_show]
-
-    # Create figure with 2 rows (original vs generated) and multiple columns
-    fig, axes = plt.subplots(2 * n_samples_show, n_time_points, 
-                           figsize=(3 * n_time_points, 3 * 2 * n_samples_show))
-    fig.suptitle("Backward Generated Samples vs Original Marginal Data (Consistent Samples)", fontsize=16)
-    
-    # Handle dimension edge cases
-    if axes.ndim == 1:
-        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
-    
-    # Determine global color scale for consistency
-    all_original = torch.cat([marginal_data[t] for t in sorted_times], dim=0).cpu().numpy()
-    all_generated = torch.cat([generated_samples[t] for t in sorted_times], dim=0).cpu().numpy()
-    vmin = min(all_original.min(), all_generated.min())
-    vmax = max(all_original.max(), all_generated.max())
-    
-    for j, t_val in enumerate(sorted_times):
-        original_data = marginal_data[t_val].cpu().numpy()
-        generated_data = generated_samples[t_val].cpu().numpy()
-        
-        for i in range(n_samples_show):
-            # Use consistent sample indices
-            sample_idx = selected_indices[i].item()
-            
-            # Original data samples
-            row_orig = 2 * i
-            if sample_idx < original_data.shape[0]:
-                sample_orig = original_data[sample_idx].reshape(resolution, resolution)
-                axes[row_orig, j].imshow(sample_orig, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
-            axes[row_orig, j].axis('off')
-            if j == 0:
-                axes[row_orig, j].set_ylabel(f'Original {i+1}', rotation=0, ha='right', va='center')
-            if i == 0:
-                axes[row_orig, j].set_title(f't = {t_val:.2f}')
-            
-            # Generated data samples  
-            row_gen = 2 * i + 1
-            if sample_idx < generated_data.shape[0]:
-                sample_gen = generated_data[sample_idx].reshape(resolution, resolution)
-                axes[row_gen, j].imshow(sample_gen, cmap='viridis', vmin=vmin, vmax=vmax, extent=[0, 1, 0, 1])
-            axes[row_gen, j].axis('off')
-            if j == 0:
-                axes[row_gen, j].set_ylabel(f'Generated {i+1}', rotation=0, ha='right', va='center')
-    
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    plt.savefig(os.path.join(output_dir, "backward_samples_comparison.png"), dpi=300, bbox_inches='tight')
-    plt.close()
+    # Create separate visualizations for better readability - use the functions defined above
+    _visualize_ground_truth_samples(marginal_data, output_dir, sample_indices)
+    _visualize_generated_backward_samples(generated_samples, output_dir, sample_indices)
 
 
 def _visualize_marginal_statistics_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
     """
     Compare statistical properties (mean, std, distribution) between original and generated samples.
     """
+    format_for_paper()
     print("  - Plotting marginal statistics comparison...")
     
     sorted_times = sorted(marginal_data.keys())
@@ -1085,6 +1156,7 @@ def _visualize_sample_distributions(marginal_data: Dict[float, Tensor], generate
     """
     Visualize the pixel-wise distributions for select time points.
     """
+    format_for_paper()
     print("  - Plotting sample distributions comparison...")
     
     sorted_times = sorted(marginal_data.keys())
@@ -1092,10 +1164,10 @@ def _visualize_sample_distributions(marginal_data: Dict[float, Tensor], generate
     n_plots = min(4, len(sorted_times))
     selected_times = [sorted_times[i] for i in np.linspace(0, len(sorted_times)-1, n_plots, dtype=int)]
     
-    fig, axes = plt.subplots(2, n_plots, figsize=(4 * n_plots, 8))
+    fig, axes = plt.subplots(2, n_plots, figsize=(min(12, 3.5 * n_plots), 7))
     if n_plots == 1:
         axes = axes.reshape(-1, 1)
-    fig.suptitle("Pixel Value Distributions: Original vs Generated", fontsize=14)
+    fig.suptitle("Pixel Value Distributions: Original vs Generated", fontsize=12)
     
     for i, t_val in enumerate(selected_times):
         # Get flattened data for histogram
@@ -1223,13 +1295,14 @@ def radial_average(data_2d: Tensor) -> Tuple[Tensor, Tensor]:
     return radii, radial_profile
 
 
-def _visualize_covariance_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
-    """Visualizes and compares the spatial ACF between original and generated samples."""
-    print("  - Plotting spatial covariance (ACF) comparison...")
+def _visualize_radial_acf_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
+    """Visualizes 1D radial ACF comparison between original and generated samples."""
+    format_for_paper()
+    print("  - Plotting 1D radial ACF comparison...")
     
     sorted_times = sorted(marginal_data.keys())
-    # Select representative time points (e.g., 5 points including start and end)
-    n_time_points = min(5, len(sorted_times))
+    # Select representative time points (e.g., 4 points including start and end)
+    n_time_points = min(4, len(sorted_times))
     selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
     selected_times = [sorted_times[i] for i in selected_indices]
 
@@ -1239,18 +1312,14 @@ def _visualize_covariance_comparison(marginal_data: Dict[float, Tensor], generat
     data_dim = marginal_data[selected_times[0]].shape[1]
     resolution = int(math.sqrt(data_dim))
     if resolution * resolution != data_dim:
-        print("    Warning: Data is not square. Skipping covariance analysis.")
+        print("    Warning: Data is not square. Skipping 1D radial ACF analysis.")
         return
 
-    # Setup figure: 3 rows (1D Radial ACF, 2D Target ACF, 2D Gen ACF)
-    fig, axes = plt.subplots(3, n_time_points, figsize=(4 * n_time_points, 12))
+    # Create single figure for 1D radial ACF - reasonable paper size
+    fig, axes = plt.subplots(1, n_time_points, figsize=(12, 3.5))
     if n_time_points == 1: 
-        axes = axes.reshape(3, 1)
-    fig.suptitle("Spatial Autocorrelation Function (ACF) Comparison (Second-Order Statistics)", fontsize=16)
-
-    # Global color scale for 2D ACF plots
-    vmin, vmax = -0.5, 1.0
-    im = None
+        axes = [axes]
+    fig.suptitle("Radial Autocorrelation Function Comparison", fontsize=12)
     
     for i, t_val in enumerate(selected_times):
         # Compute ACFs (ensure data is on CPU for computation)
@@ -1267,38 +1336,86 @@ def _visualize_covariance_comparison(marginal_data: Dict[float, Tensor], generat
         # Convert radii to physical distance (assuming domain L=1.0)
         physical_radii = radii.numpy() / resolution
 
-        # Row 1: 1D Radial ACF Comparison
-        ax_1d = axes[0, i]
-        ax_1d.plot(physical_radii, radial_target.numpy(), 'b-', label='Target', linewidth=2)
-        ax_1d.plot(physical_radii, radial_gen.numpy(), 'r--', label='Generated', linewidth=2)
-        ax_1d.set_title(f't={t_val:.2f} (MSE={mse_acf:.2e})')
-        ax_1d.set_xlabel('Lag Distance (r/L)')
-        ax_1d.set_ylim(-0.1, 1.05)
-        ax_1d.grid(True, alpha=0.3)
+        # 1D Radial ACF Comparison
+        ax = axes[i]
+        ax.plot(physical_radii, radial_target.numpy(), 'b-', label='Target', linewidth=2)
+        ax.plot(physical_radii, radial_gen.numpy(), 'r--', label='Generated', linewidth=2)
+        ax.set_title(f't = {t_val:.2f}\nMSE = {mse_acf:.2e}')
+        ax.set_xlabel('Lag Distance (r/L)')
+        ax.set_ylim(-0.1, 1.05)
+        ax.grid(True, alpha=0.3)
         if i == 0: 
-            ax_1d.set_ylabel('Radial ACF R(r)')
+            ax.set_ylabel('Radial ACF R(r)')
         if i == n_time_points - 1:
-            ax_1d.legend()
+            ax.legend()
 
-        # Row 2: 2D Target ACF
-        ax_target = axes[1, i]
-        im = ax_target.imshow(acf_target.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
-        ax_target.set_title('Target 2D ACF')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "radial_acf_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _visualize_2d_acf_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
+    """Visualizes 2D spatial ACF comparison between original and generated samples."""
+    format_for_paper()
+    print("  - Plotting 2D ACF comparison...")
+    
+    sorted_times = sorted(marginal_data.keys())
+    # Select representative time points (e.g., 3 points for 2D visualization)
+    n_time_points = min(3, len(sorted_times))
+    selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
+    selected_times = [sorted_times[i] for i in selected_indices]
+
+    # Determine resolution
+    if not selected_times: 
+        return
+    data_dim = marginal_data[selected_times[0]].shape[1]
+    resolution = int(math.sqrt(data_dim))
+    if resolution * resolution != data_dim:
+        print("    Warning: Data is not square. Skipping 2D ACF analysis.")
+        return
+
+    # Create figure for 2D ACF comparison - reasonable paper size
+    fig, axes = plt.subplots(2, n_time_points, figsize=(10, 6))
+    if n_time_points == 1: 
+        axes = axes.reshape(2, 1)
+    fig.suptitle("2D Spatial Autocorrelation Function Comparison", fontsize=12)
+
+    # Global color scale for 2D ACF plots
+    vmin, vmax = -0.5, 1.0
+    
+    for i, t_val in enumerate(selected_times):
+        # Compute ACFs (ensure data is on CPU for computation)
+        acf_target = compute_spatial_acf_2d(marginal_data[t_val].cpu(), resolution)
+        acf_gen = compute_spatial_acf_2d(generated_samples[t_val].cpu(), resolution)
+        
+        # Calculate MSE_ACF
+        mse_acf = torch.mean((acf_target - acf_gen)**2).item()
+
+        # Row 1: 2D Target ACF
+        ax_target = axes[0, i]
+        im_target = ax_target.imshow(acf_target.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
+        ax_target.set_title(f'Target ACF\nt = {t_val:.2f}')
         if i == 0: 
             ax_target.set_ylabel('Y Lag')
         
-        # Row 3: 2D Generated ACF
-        ax_gen = axes[2, i]
-        ax_gen.imshow(acf_gen.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
-        ax_gen.set_title('Generated 2D ACF')
+        # Row 2: 2D Generated ACF
+        ax_gen = axes[1, i]
+        im_gen = ax_gen.imshow(acf_gen.numpy(), cmap='viridis', vmin=vmin, vmax=vmax, extent=[-0.5, 0.5, -0.5, 0.5])
+        ax_gen.set_title(f'Generated ACF\nMSE = {mse_acf:.2e}')
         ax_gen.set_xlabel('X Lag')
         if i == 0: 
             ax_gen.set_ylabel('Y Lag')
+            
+        # Add individual colorbars for each ACF plot
+        plt.colorbar(im_target, ax=ax_target, fraction=0.046, pad=0.04)
+        plt.colorbar(im_gen, ax=ax_gen, fraction=0.046, pad=0.04)
 
-    # Add colorbar
-    if im is not None:
-        fig.colorbar(im, ax=axes[1:, :].ravel().tolist(), fraction=0.046, pad=0.04, label="Correlation")
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(output_dir, "covariance_comparison.png"), dpi=300)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "2d_acf_comparison.png"), dpi=300, bbox_inches='tight')
     plt.close()
+
+
+def _visualize_covariance_comparison(marginal_data: Dict[float, Tensor], generated_samples: Dict[float, Tensor], output_dir: str):
+    """Wrapper function to generate both 1D and 2D ACF comparison plots."""
+    _visualize_radial_acf_comparison(marginal_data, generated_samples, output_dir)
+    _visualize_2d_acf_comparison(marginal_data, generated_samples, output_dir)
