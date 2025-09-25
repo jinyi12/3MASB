@@ -71,7 +71,7 @@ class GLOWExperimentRunner:
         self.fixed_params = {
             "grf": True,
             "lcl": True,
-            "epochs": 10,
+            "epochs": 500,
             "lambda_lcl": 1000,  # High weight for strong trajectory consistency
             "hidden_size": 64,
             "lr": 1e-3,
@@ -83,7 +83,7 @@ class GLOWExperimentRunner:
             "weight_decay": 1e-4,  # Weight decay for optimizer
             "grad_clip_norm": 1.0,  # Gradient clipping
             "n_training_trajectories": 512,  # Subset used for training (formerly n_trajectories)
-            "n_validation_trajectories": 512,  # Dedicated trajectories for validation metrics
+            "n_validation_trajectories": 1024,  # Dedicated trajectories for validation metrics
             "training_noise_std": 0.0,  # Training noise (disabled by default)
             "sigma_reverse": 0.5,  # Reverse SDE noise level
             "covariance_type": "gaussian",  # Default GRF kernel type

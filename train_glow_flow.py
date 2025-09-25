@@ -1063,6 +1063,19 @@ def main():
         default=None,
         help="Number of trajectories for validation metrics (defaults to n_trajectories if not specified)",
     )
+    # Evaluation / visualization options
+    parser.add_argument(
+        "--n_viz_particles",
+        type=int,
+        default=256,
+        help="Number of particles to generate for visualization (visuals only, does not affect validation)",
+    )
+    parser.add_argument(
+        "--n_sde_steps",
+        type=int,
+        default=100,
+        help="Number of SDE integration steps used for backward sampling and visualization",
+    )
     
     # Experiment parameters for downstream analysis
     parser.add_argument("--n_samples", type=int, help="Number of training samples")
