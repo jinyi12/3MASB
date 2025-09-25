@@ -722,8 +722,9 @@ def setup_experiment(args) -> Dict:
         
         # Evaluation parameters
         "n_sde_steps": getattr(args, 'n_sde_steps', 100),
-        "n_viz_particles": getattr(args, 'n_viz_particles', 256),
-        "n_trajectories": getattr(args, 'n_trajectories', 512),
+        "n_viz_particles": getattr(args, 'n_viz_particles', 256),  # For visualization only
+        "n_trajectories": getattr(args, 'n_trajectories', 512),  # For training
+        "n_validation_trajectories": getattr(args, 'n_validation_trajectories', 512),  # For validation metrics
     }
     
     # Compute derived parameters
@@ -860,10 +861,15 @@ def validate_model(bridge, marginal_data, config):
         try:
             # Use comparative backward sampler (same as C-CVEP validation)
             # This generates backward trajectories from t=1.0 (macroscale) to t=0.0 (microscale)
+            # CRITICAL FIX: Use dedicated validation parameter, not visualization parameter
+            # This ensures validation metrics are computed consistently and independently
+            # from the number of particles used for visualization
+            n_validation = config.get("n_validation_trajectories", config.get("n_trajectories", 512))
+            print(f"Using {n_validation} trajectories for validation metrics computation")
             original_data, generated_samples = generate_comparative_backward_samples(
                 bridge=bridge,
                 marginal_data=marginal_data,
-                n_samples=config["n_viz_particles"],
+                n_samples=n_validation,
                 n_steps=config["n_sde_steps"],
                 device=config["device"],
             )
@@ -1049,12 +1055,19 @@ def main():
         "--n_trajectories",
         type=int,
         default=512,
-        help="Number of paired trajectories for ATR/LCL",
+        help="Number of paired trajectories for ATR/LCL training",
+    )
+    parser.add_argument(
+        "--n_validation_trajectories",
+        type=int,
+        default=None,
+        help="Number of trajectories for validation metrics (defaults to n_trajectories if not specified)",
     )
     
     # Experiment parameters for downstream analysis
     parser.add_argument("--n_samples", type=int, help="Number of training samples")
     parser.add_argument("--micro_corr_length", type=float, help="GRF correlation length")
+    parser.add_argument("--covariance_type", type=str, help="GRF kernel type (exponential or gaussian)")
     parser.add_argument("--resolution", type=int, help="Spatial resolution")
     parser.add_argument("--hidden_size", type=int, help="Model hidden size")
     parser.add_argument("--n_blocks_flow", type=int, help="Number of GLOW blocks")

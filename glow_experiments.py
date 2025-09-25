@@ -3,20 +3,40 @@
 Parameter Experimentation for GLOW Flow
 ==============================================
 
-Focused analysis of correlation length and training samples effects on GLOW bridge performance.
+Systematic analysis of GLOW bridge performance across different parameter spaces.
 Uses LCL training with optimized parameters for systematic experimentation.
 
+METHODOLOGICAL IMPROVEMENTS (following the recommended actions):
+- Clear parameter hierarchy: ground_truth → training → validation → visualization
+- Separation of concerns: validation metrics computed independently of visualization  
+- Consistent trajectory counts: all validation metrics use same sample size
+- Explicit naming: removes ambiguity between "samples" and "trajectories"
+
 Key Features:
-- Correlation length analysis (0.05 to 0.5)  
-- Training trajectory count analysis (128 to 1024)
-- Fixed LCL parameters: λ_lcl=1000, epochs=500, hidden_size=64
+- **Kernel Analysis**: Different GRF smoothness (exponential vs gaussian kernels)
+- **Correlation Length Analysis**: GRF spatial correlation (0.05 to 0.5)  
+- **Training Trajectory Analysis**: LCL training subset sizes (128 to 1024)
+- **Nested Experiments**: Kernel -> (Correlation + Trajectory) structure
+- Fixed LCL parameters: λ_lcl=1000, epochs=10, hidden_size=64
+- Methodologically rigorous parameter separation:
+  * n_ground_truth_trajectories: Total simulated trajectories
+  * n_training_trajectories: Subset used for training
+  * n_validation_trajectories: Consistent validation metrics
+  * n_viz_particles: Visualization only (separate from validation)
 - Automated result collection and comparison
 - Simple, scriptable parameter sweeping
 
+Experiment Structure:
+    --kernels: Test exponential vs gaussian GRF kernels
+    --comprehensive: For each kernel, run full parameter analysis
+    --correlation: Test correlation lengths (single kernel)
+    --samples: Test trajectory counts (single kernel) 
+    --both: Run correlation + trajectory analysis (single kernel)
+
 Usage:
-    python glow_experiments.py --correlation
-    python glow_experiments.py --samples
-    python glow_experiments.py --both
+    python glow_experiments.py --comprehensive  # Full kernel study
+    python glow_experiments.py --kernels        # Just kernel comparison
+    python glow_experiments.py --both           # Standard parameter sweep
 """
 
 import sys
@@ -31,6 +51,15 @@ class GLOWExperimentRunner:
     """
     Simple experiment runner following KISS principle.
     Manages parameter sweeps and result collection for GLOW flow analysis.
+    
+    Parameter Structure (following methodological rigor):
+    - n_ground_truth_trajectories: Total trajectories from ground truth simulation
+    - n_training_trajectories: Subset used for model training  
+    - n_validation_trajectories: Consistent number for validation metrics
+    - n_viz_particles: For visualization only (separate from validation)
+    
+    This ensures validation metrics are computed consistently and independently
+    from visualization parameters, preventing methodological confusion.
     """
     
     def __init__(self, base_output_dir="experiments_glow_refined", save_metrics: bool = True, enable_covariance_analysis: bool = True):
@@ -49,13 +78,18 @@ class GLOWExperimentRunner:
             "resolution": 16,  # Standard GRF resolution
             "lambda_path": 0.01,  # Moderate path regularization
             "T": 1.0,  # Time horizon
-            "n_samples": 1024,  # Default sample size
+            "n_ground_truth_trajectories": 1024,  # Total trajectories from ground truth simulation
             "n_blocks_flow": 2,  # Number of GLOW flow blocks
             "weight_decay": 1e-4,  # Weight decay for optimizer
             "grad_clip_norm": 1.0,  # Gradient clipping
-            "n_trajectories": 512,  # Number of trajectories for LCL
+            "n_training_trajectories": 512,  # Subset used for training (formerly n_trajectories)
+            "n_validation_trajectories": 512,  # Dedicated trajectories for validation metrics
             "training_noise_std": 0.0,  # Training noise (disabled by default)
             "sigma_reverse": 0.5,  # Reverse SDE noise level
+            "covariance_type": "gaussian",  # Default GRF kernel type
+            # Evaluation parameters (methodologically rigorous separation)
+            "n_viz_particles": 256,  # For visualization only (not used in validation)
+            "n_sde_steps": 100,      # SDE integration steps
             # Simple toggles (KISS: booleans only)
             "save_metrics": bool(save_metrics),
             "enable_covariance_analysis": bool(enable_covariance_analysis),
@@ -89,12 +123,20 @@ class GLOWExperimentRunner:
         if self.fixed_params.get("lcl"):
             args.append("--lcl")
             
-        # Add all parameters
+        # Add all parameters (with backward compatibility mapping)
         all_params = {**self.fixed_params, **param_overrides}
         for key, value in all_params.items():
             if key in ["grf", "lcl", "save_metrics", "enable_covariance_analysis"]:  # Skip boolean flags (handled separately)
                 continue
-            args.extend([f"--{key}", str(value)])
+            # Map new parameter names to train_glow_flow.py expected names
+            if key == "n_ground_truth_trajectories":
+                args.extend(["--n_samples", str(value)])  # Maps to N_samples in data generation
+            elif key == "n_training_trajectories":
+                args.extend(["--n_trajectories", str(value)])  # Maps to training subset size
+            elif key == "n_validation_trajectories":
+                args.extend(["--n_validation_trajectories", str(value)])  # New parameter for validation
+            else:
+                args.extend([f"--{key}", str(value)])
         
         # Add output directory
         args.extend(["--output_dir", str(exp_dir)])
@@ -205,7 +247,7 @@ class GLOWExperimentRunner:
         print("CORRELATION LENGTH ANALYSIS")
         print("="*80)
         print("Testing GRF correlation length effects on GLOW bridge performance")
-        print("Fixed: LCL training, λ_lcl=1000, epochs=500, n_samples=1024")
+        print("Fixed: LCL training, λ_lcl=1000, epochs=500, n_ground_truth_trajectories=1024")
         
         # Correlation lengths to test (logarithmic spacing for good coverage)
         correlation_lengths = [0.05, 0.1, 0.2, 0.3, 0.5]
@@ -219,7 +261,7 @@ class GLOWExperimentRunner:
             experiment_name = f"corr_length_{corr_length:.3f}"
             param_overrides = {
                 "micro_corr_length": corr_length,
-                "n_samples": 1024,  # Fixed sample size
+                "n_ground_truth_trajectories": 1024,  # Fixed ground truth size
             }
             
             result = self.run_single_experiment(experiment_name, param_overrides)
@@ -291,20 +333,21 @@ class GLOWExperimentRunner:
         print("TRAINING TRAJECTORY COUNT ANALYSIS") 
         print("="*80)
         print("Testing training trajectory count effects on GLOW bridge LCL convergence")
-        print("Fixed: LCL training, λ_lcl=1000, epochs=500, corr_length=0.1, n_samples=1024")
+        print("Fixed: LCL training, λ_lcl=1000, epochs=500, corr_length=0.1, n_ground_truth_trajectories=1024")
         
-        # Trajectory counts to test (powers of 2 for systematic scaling)
-        trajectory_counts = [128, 256, 512, 1024]
+        # Training trajectory counts to test (powers of 2 for systematic scaling)
+        training_trajectory_counts = [128, 256, 512, 1024]
         
         results = []
         per_time_w2 = []
         per_time_relf = []
         
-        for n_traj in trajectory_counts:
-            experiment_name = f"trajectories_{n_traj}"
+        for n_train_traj in training_trajectory_counts:
+            experiment_name = f"training_trajectories_{n_train_traj}"
             param_overrides = {
-                "n_trajectories": n_traj,
+                "n_training_trajectories": n_train_traj,
                 "micro_corr_length": 0.1,  # Fixed correlation length
+                "n_ground_truth_trajectories": max(n_train_traj, 1024),  # Ensure enough ground truth data
             }
             
             result = self.run_single_experiment(experiment_name, param_overrides)
@@ -329,8 +372,8 @@ class GLOWExperimentRunner:
 
         # Save summary
         summary = {
-            "analysis_type": "trajectory_count",
-            "parameter_range": trajectory_counts,
+            "analysis_type": "training_trajectory_count",
+            "parameter_range": training_trajectory_counts,
             "fixed_parameters": self.fixed_params,
             "results": results,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -360,14 +403,93 @@ class GLOWExperimentRunner:
             # Show scaling behavior
             print("\nScaling analysis:")
             for result in successful:
-                n_traj = result["parameters"]["n_trajectories"]
+                n_traj = result["parameters"]["n_training_trajectories"]
                 runtime = result["elapsed_time"]
-                print(f"  {n_traj:4d} trajectories: {runtime:5.1f}s")
+                print(f"  {n_traj:4d} training trajectories: {runtime:5.1f}s")
         
         print(f"\nDetailed results saved to: {summary_file}")
         print("Individual experiment outputs in subdirectories")
         
         return results
+    
+    def kernel_analysis(self):
+        """
+        Systematic analysis of different GRF kernel types.
+        Tests how covariance_type (kernel smoothness) affects model performance.
+        For each kernel, runs both correlation length and trajectory count analyses.
+        """
+        print("\n" + "="*80)
+        print("KERNEL SMOOTHNESS ANALYSIS")
+        print("="*80)
+        print("Testing different GRF kernel types on GLOW bridge performance")
+        print("Each kernel runs full correlation + trajectory analysis")
+        
+        # Available kernel types (KISS: just the two supported ones)
+        kernel_types = ["exponential", "gaussian"]
+        
+        all_results = {}
+        
+        for kernel_type in kernel_types:
+            print(f"\n{'='*60}")
+            print(f"KERNEL: {kernel_type.upper()}")
+            print(f"{'='*60}")
+            
+            # Create kernel-specific subdirectory
+            kernel_dir = self.base_output_dir / f"kernel_{kernel_type}"
+            kernel_dir.mkdir(exist_ok=True)
+            
+            # Temporarily override base output dir and covariance_type
+            original_base_dir = self.base_output_dir
+            original_cov_type = self.fixed_params["covariance_type"]
+            
+            self.base_output_dir = kernel_dir
+            self.fixed_params["covariance_type"] = kernel_type
+            
+            try:
+                # Run full parameter analysis for this kernel
+                corr_results = self.correlation_length_analysis()
+                sample_results = self.sample_size_analysis()
+                
+                all_results[kernel_type] = {
+                    "correlation_results": corr_results,
+                    "trajectory_count_results": sample_results,
+                    "total_experiments": len(corr_results) + len(sample_results)
+                }
+                
+            finally:
+                # Restore original settings
+                self.base_output_dir = original_base_dir
+                self.fixed_params["covariance_type"] = original_cov_type
+        
+        # Save kernel analysis summary
+        summary = {
+            "analysis_type": "kernel_smoothness",
+            "kernels_tested": kernel_types,
+            "results_by_kernel": all_results,
+            "total_experiments": sum(r["total_experiments"] for r in all_results.values()),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        summary_file = self.base_output_dir / "kernel_analysis_summary.json"
+        with open(summary_file, "w") as f:
+            json.dump(summary, f, indent=2)
+        
+        # Print summary
+        print("\n" + "="*80)
+        print("KERNEL SMOOTHNESS ANALYSIS SUMMARY")
+        print("="*80)
+        
+        total_experiments = 0
+        for kernel_type, results in all_results.items():
+            n_exp = results["total_experiments"]
+            total_experiments += n_exp
+            print(f"  {kernel_type:12s}: {n_exp:3d} experiments")
+        
+        print(f"\nTotal experiments: {total_experiments}")
+        print(f"Results directory: {self.base_output_dir}")
+        print(f"Kernel summary: {summary_file}")
+        
+        return all_results
     
     def combined_analysis(self):
         """
@@ -406,6 +528,20 @@ class GLOWExperimentRunner:
         print(f"Combined summary: {summary_file}")
         
         return combined_summary
+    
+    def comprehensive_kernel_analysis(self):
+        """
+        Complete kernel analysis: for each kernel type, run full parameter exploration.
+        This is the comprehensive experiment following the structure:
+        Kernel -> (Correlation Analysis + Trajectory Analysis)
+        """
+        print("\n" + "="*80)
+        print("COMPREHENSIVE KERNEL ANALYSIS")
+        print("="*80)
+        print("Complete parameter exploration for each GRF kernel type")
+        print("Structure: Kernel -> (Correlation + Trajectory) experiments")
+        
+        return self.kernel_analysis()
 
     # --- Helpers for aggregating metrics across experiments ---
     def aggregate_all_metrics(self, out_csv: str = None):
@@ -495,7 +631,9 @@ Examples:
     python glow_experiments.py --correlation
     python glow_experiments.py --samples
     python glow_experiments.py --both
-    python glow_experiments.py --both --output experiments_custom
+    python glow_experiments.py --kernels
+    python glow_experiments.py --comprehensive
+    python glow_experiments.py --comprehensive --output experiments_kernel_study
         """
     )
     
@@ -518,6 +656,18 @@ Examples:
     )
     
     parser.add_argument(
+        "--kernels",
+        action="store_true",
+        help="Run kernel analysis (exponential vs gaussian kernels)"
+    )
+    
+    parser.add_argument(
+        "--comprehensive",
+        action="store_true",
+        help="Run comprehensive kernel analysis (all kernels x all parameters)"
+    )
+    
+    parser.add_argument(
         "--output",
         type=str,
         default="experiments_glow_refined",
@@ -537,9 +687,9 @@ Examples:
     args = parser.parse_args()
     
     # Validate arguments
-    if not (args.correlation or args.samples or args.both):
+    if not (args.correlation or args.samples or args.both or args.kernels or args.comprehensive):
         print("Error: Must specify at least one analysis type")
-        print("Use --correlation, --samples, or --both")
+        print("Use --correlation, --samples, --both, --kernels, or --comprehensive")
         parser.print_help()
         return 1
     
@@ -550,6 +700,11 @@ Examples:
     print("REFINED GLOW FLOW EXPERIMENTATION")
     print("="*80)
     print("Systematic parameter analysis with LCL training")
+    print("Methodologically rigorous parameter separation:")
+    print("  • n_ground_truth_trajectories: Total simulated dataset size")
+    print("  • n_training_trajectories: Subset used for model training")
+    print("  • n_validation_trajectories: Consistent validation metrics")
+    print("  • n_viz_particles: Visualization only (separate from validation)")
     print(f"Output directory: {runner.base_output_dir}")
     print("Fixed parameters:")
     for key, value in sorted(runner.fixed_params.items()):
@@ -557,7 +712,11 @@ Examples:
     print("="*80)
     
     try:
-        if args.both:
+        if args.comprehensive:
+            runner.comprehensive_kernel_analysis()
+        elif args.kernels:
+            runner.kernel_analysis()
+        elif args.both:
             runner.combined_analysis()
         else:
             if args.correlation:
