@@ -11,3 +11,4 @@ __pycache__
 # ignore specific files
 sde_matching_from_scratch.ipynb
 multiscalemodeling_bridge_preliminary_plan.md
+*.json
