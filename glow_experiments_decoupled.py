@@ -43,7 +43,7 @@ import sys
 import json
 import time
 from pathlib import Path
-from train_glow_flow import main as train_main
+from train_glow_flow_decoupled import main as train_main
 import numpy as np
 
 
@@ -67,17 +67,16 @@ class GLOWExperimentRunner:
         self.base_output_dir = Path(base_output_dir)
         self.base_output_dir.mkdir(exist_ok=True)
         
-        # Fixed experimental parameters for trajectory-based training
+        # Fixed experimental parameters for decoupled training
         self.fixed_params = {
             "grf": True,
-            "lcl": True,
-            "initloss": False,
-            "epochs": 1000,
-            "lambda_lcl": 1000,  # Consistency weight (used for both LCL and initial condition)
+            "density_epochs": 500,
+            "dynamics_epochs": 500,
             "hidden_size": 64,
-            "lr": 1e-3,
+            "density_lr": 1e-3,
+            "dynamics_lr": 1e-3,
             "resolution": 16,  # Standard GRF resolution
-            "lambda_path": 0.01,  # Moderate path regularization
+            "lambda_path": 0.0,  # Moderate path regularization
             "T": 1.0,  # Time horizon
             "n_ground_truth_trajectories": 1024,  # Total trajectories from ground truth simulation
             "n_blocks_flow": 2,  # Number of GLOW flow blocks
@@ -85,15 +84,16 @@ class GLOWExperimentRunner:
             "grad_clip_norm": 1.0,  # Gradient clipping
             "n_training_trajectories": 512,  # Subset used for training (formerly n_trajectories)
             "n_validation_trajectories": 1024,  # Dedicated trajectories for validation metrics
-            "training_noise_std": 0.01,  # CRITICAL FIX: Enable variational dequantization (was 0.0)
+            "training_noise_std": 0.01,  # Enable variational dequantization (was 0.0)
             "sigma_reverse": 0.5,  # Reverse SDE noise level
             "covariance_type": "gaussian",  # Default GRF kernel type
             # Evaluation parameters (methodologically rigorous separation)
             "n_viz_particles": 256,  # For visualization only (not used in validation)
             "n_sde_steps": 100,      # SDE integration steps
-            # Simple toggles (KISS: booleans only)
+            # Simple toggles (booleans only)
             "save_metrics": bool(save_metrics),
             "enable_covariance_analysis": bool(enable_covariance_analysis),
+            "validation_batch_size": 512,  # Batch size for validation (controls memory usage)
         }
     
     def run_single_experiment(self, experiment_name: str, param_overrides: dict) -> dict:
@@ -121,15 +121,11 @@ class GLOWExperimentRunner:
         # Add fixed parameters
         if self.fixed_params.get("grf"):
             args.append("--grf")
-        if self.fixed_params.get("lcl"):
-            args.append("--lcl")
-        if self.fixed_params.get("initloss"):
-            args.append("--initloss")
             
         # Add all parameters (with backward compatibility mapping)
         all_params = {**self.fixed_params, **param_overrides}
         for key, value in all_params.items():
-            if key in ["grf", "lcl", "initloss", "save_metrics", "enable_covariance_analysis"]:  # Skip boolean flags (handled separately)
+            if key in ["grf", "save_metrics", "enable_covariance_analysis"]:  # Skip boolean flags (handled separately)
                 continue
             # Map new parameter names to train_glow_flow.py expected names
             if key == "n_ground_truth_trajectories":
@@ -158,7 +154,7 @@ class GLOWExperimentRunner:
         
         # Run experiment
         original_argv = sys.argv.copy()
-        sys.argv = ["train_glow_flow.py"] + args
+        sys.argv = ["train_glow_flow_decoupled.py"] + args
         
         start_time = time.time()
         try:
@@ -250,7 +246,7 @@ class GLOWExperimentRunner:
         print("CORRELATION LENGTH ANALYSIS")
         print("="*80)
         print("Testing GRF correlation length effects on GLOW bridge performance")
-        print("Fixed: LCL training, λ_lcl=1000, epochs=500, n_ground_truth_trajectories=1024")
+        print("Fixed: Decoupled training, epochs=1000+1000, n_ground_truth_trajectories=1024")
         
         # Correlation lengths to test (logarithmic spacing for good coverage)
         correlation_lengths = [0.05, 0.1, 0.2, 0.3, 0.5]
@@ -335,8 +331,8 @@ class GLOWExperimentRunner:
         print("\n" + "="*80)
         print("TRAINING TRAJECTORY COUNT ANALYSIS") 
         print("="*80)
-        print("Testing training trajectory count effects on GLOW bridge LCL convergence")
-        print("Fixed: LCL training, λ_lcl=1000, epochs=500, corr_length=0.1, n_ground_truth_trajectories=1024")
+        print("Testing training trajectory count effects on GLOW bridge convergence")
+        print("Fixed: Decoupled training, epochs=1000+1000, corr_length=0.1, n_ground_truth_trajectories=1024")
         
         # Training trajectory counts to test (powers of 2 for systematic scaling)
         training_trajectory_counts = [128, 256, 512, 1024]
@@ -700,9 +696,9 @@ Examples:
     runner = GLOWExperimentRunner(args.output, save_metrics=getattr(args, 'save_metrics', True), enable_covariance_analysis=getattr(args, 'enable_covariance_analysis', True))
     
     print("="*80)
-    print("REFINED GLOW FLOW EXPERIMENTATION")
+    print("REFINED GLOW FLOW EXPERIMENTATION (DECOUPLED)")
     print("="*80)
-    print("Systematic parameter analysis with LCL training")
+    print("Systematic parameter analysis with decoupled architecture")
     print("Methodologically rigorous parameter separation:")
     print("  • n_ground_truth_trajectories: Total simulated dataset size")
     print("  • n_training_trajectories: Subset used for model training")
