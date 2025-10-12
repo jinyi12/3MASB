@@ -2,6 +2,76 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+
+class ConcatELU(nn.Module):
+    """Activation function applying ELU in both directions for stronger gradients."""
+    def forward(self, x):
+        return torch.cat([F.elu(x), F.elu(-x)], dim=1)
+
+class LayerNormChannels(nn.Module):
+    """Layer normalization across channels in an image."""
+    def __init__(self, c_in, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, c_in, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c_in, 1, 1))
+        self.eps = eps
+    
+    def forward(self, x):
+        mean = x.mean(dim=1, keepdim=True)
+        var = x.var(dim=1, unbiased=False, keepdim=True)
+        y = (x - mean) / torch.sqrt(var + self.eps)
+        y = y * self.gamma + self.beta
+        return y
+
+class GatedConv(nn.Module):
+    """Gated convolutional ResNet block with sigmoid gating."""
+    def __init__(self, c_in, c_hidden):
+        super().__init__()
+        self.net = nn.Sequential(
+            ConcatELU(),
+            # CRITICAL FIX: Use 5x5 for better spatial mixing
+            nn.Conv2d(c_in * 2, c_hidden, kernel_size=5, padding=2),
+            ConcatELU(),
+            nn.Conv2d(c_hidden * 2, c_in * 2, kernel_size=1)
+        )
+
+    def forward(self, x):
+        out = self.net(x)
+        val, gate = out.chunk(2, dim=1)
+        return x + val * torch.sigmoid(gate)
+
+class GatedConvNet(nn.Module):
+    """Network utilizing Gated Convolution blocks for coupling layers."""
+    def __init__(self, c_in, c_hidden=32, c_out=-1, num_layers=3):
+        """
+        Args:
+            c_in: Number of input channels
+            c_hidden: Number of hidden dimensions within the network
+            c_out: Number of output channels. If -1, 2*c_in (for affine coupling)
+            num_layers: Number of gated ResNet blocks
+        """
+        super().__init__()
+        c_out = c_out if c_out > 0 else 2 * c_in
+        layers = []
+        # CRITICAL FIX: Use 5x5 kernel for larger receptive field to combat checkerboard
+        layers += [nn.Conv2d(c_in, c_hidden, kernel_size=5, padding=2)]
+        for _ in range(num_layers):
+            layers += [GatedConv(c_hidden, c_hidden),
+                       LayerNormChannels(c_hidden)]
+        layers += [ConcatELU(),
+                   nn.Conv2d(c_hidden * 2, c_out, kernel_size=3, padding=1)]
+        self.nn = nn.Sequential(*layers)
+        
+        # Zero initialization for last layer
+        self.nn[-1].weight.data.zero_()
+        self.nn[-1].bias.data.zero_()
+
+    def forward(self, x):
+        return self.nn(x)
+
+
+
 # FIX: Use torch.linalg instead of scipy.linalg for consistency and stability
 
 # ============================================================================
@@ -115,6 +185,105 @@ class Invertible1x1Conv(nn.Module):
             
         log_det_jac = log_det_jac + d_log_det
         return x, log_det_jac
+    
+    
+# ============================================================================
+# Identity at t=0 Layers for Dynamics Model (T_theta) - NEW
+# ============================================================================
+
+# Add to glow_layers.py
+class TimeDependentActNorm(nn.Module):
+    """
+    ActNorm that is identity at t=0. Learns a scale and bias that are scaled by t.
+    y = (x + t*bias) * exp(t*log_scale)
+    """
+    def __init__(self, num_features, log_scale_clamp=5.0):
+        super().__init__()
+        self.log_scale_clamp = log_scale_clamp
+        
+        # Learnable parameters that represent the transformation at t=1
+        self.log_scale_params = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+        self.bias_params = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+
+    def forward(self, x, t, log_det_jac, reverse=False):
+        # Scale learnable parameters by time t
+        time_scale = t.view(-1, 1, 1, 1)
+        log_scale = time_scale * self.log_scale_params
+        bias = time_scale * self.bias_params
+        
+        # Clamp for stability
+        log_scale = torch.clamp(log_scale, -self.log_scale_clamp, self.log_scale_clamp)
+        
+        H, W = x.shape[2], x.shape[3]
+
+        if not reverse:
+            x = torch.exp(log_scale) * (x + bias)
+            d_log_det = torch.sum(log_scale, dim=[1, 2, 3]) * H * W
+            log_det_jac = log_det_jac + d_log_det
+        else:
+            x = x * torch.exp(-log_scale) - bias
+            d_log_det = torch.sum(log_scale, dim=[1, 2, 3]) * H * W
+            log_det_jac = log_det_jac - d_log_det
+            
+        return x, log_det_jac
+    
+    
+# Add to glow_layers.py
+class TimeDependentInvertible1x1Conv(Invertible1x1Conv):
+    """
+    Invertible 1x1 Convolution that is the identity matrix at t=0.
+    The learnable components of the PLU decomposition are scaled by t.
+    """
+    def __init__(self, num_channels, log_s_clamp=5.0):
+        super().__init__(num_channels, log_s_clamp)
+        # Re-initialize to guarantee identity base
+        self.P.data.copy_(torch.eye(num_channels))
+        self.sign_s.data.fill_(1.0)
+        self.L.data.zero_()
+        self.log_s.data.zero_()
+        self.U.data.zero_()
+
+    def _get_weight(self, t, reverse):
+        time_scale = t.view(-1, 1, 1) # For broadcasting across C x C matrices
+        
+        # Scale the learnable parameters that deviate from identity
+        L_scaled = (self.L * time_scale) * self.L_mask + self.I
+        log_s_scaled = self.log_s * time_scale.squeeze(-1)
+        U_scaled = (self.U * time_scale) * self.L_mask.T + torch.diag_embed(self.sign_s * torch.exp(log_s_scaled))
+
+        if not reverse:
+            # P is fixed, so no need to batch it if it's the identity
+            W = self.P @ L_scaled @ U_scaled
+        else:
+            # Batched matrix inverse
+            W = torch.linalg.inv(U_scaled) @ torch.linalg.inv(L_scaled) @ self.P.T
+        
+        return W.view(-1, self.num_channels, self.num_channels, 1, 1)
+
+    def forward(self, x, t, log_det_jac, reverse=False):
+        B, C, H, W = x.shape
+        # Ensure time tensor has a batch dimension
+        if t.shape[0] != B:
+            t = t.expand(B, -1)
+
+        weight = self._get_weight(t, reverse)
+        
+        # Batched convolution
+        x_reshaped = x.view(1, B * C, H, W)
+        weight_reshaped = weight.view(B * C, C, 1, 1)
+        out = F.conv2d(x_reshaped, weight_reshaped, groups=B).view(B, C, H, W)
+        
+        # Batched log determinant
+        time_scale = t.view(-1, 1)
+        log_s_scaled = self.log_s.unsqueeze(0) * time_scale
+        d_log_det = log_s_scaled.sum(dim=1) * H * W
+        
+        if reverse:
+            log_det_jac = log_det_jac - d_log_det
+        else:
+            log_det_jac = log_det_jac + d_log_det
+            
+        return out, log_det_jac
 
 class TimeCondAffineCoupling(nn.Module):
     """Time-Conditioned Affine Coupling Layer (Stabilized)."""
