@@ -9,6 +9,8 @@ distribution comparisons, and data fitting analysis.
 
 import torch
 from torch import Tensor
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless environments
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import numpy as np
@@ -20,7 +22,52 @@ from scipy.stats import gaussian_kde
 from typing import Dict, Tuple
 
 from .simulation import solve_gaussian_bridge_reverse_sde, solve_backward_sde_euler_maruyama, generate_backward_samples
-from .validation import compute_sample_covariance_matrix, relative_covariance_frobenius_distance
+from .validation import compute_sample_covariance_matrix
+# Correlation functions are defined inline below
+
+# Add correlation computation functions
+def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
+    """
+    Computes the full DxD sample correlation matrix for a batch of samples.
+    Args:
+        samples: Tensor of shape [N, D] (N samples, D dimensions).
+    Returns:
+        Correlation matrix of shape [D, D].
+    """
+    N, D = samples.shape
+    if N <= 1:
+        print(f"Warning: Insufficient samples (N={N}) to compute correlation. Returning identity matrix.")
+        return torch.eye(D, device=samples.device)
+    try:
+        # Compute covariance matrix first
+        cov_matrix = torch.cov(samples.T)
+        # Extract standard deviations
+        std_devs = torch.sqrt(torch.diag(cov_matrix))
+        # Handle zero standard deviations
+        std_devs = torch.clamp(std_devs, min=1e-9)
+        # Compute correlation matrix: Corr = D^(-1/2) * Cov * D^(-1/2)
+        inv_std = 1.0 / std_devs
+        correlation_matrix = cov_matrix * inv_std.unsqueeze(0) * inv_std.unsqueeze(1)
+        # Clamp to valid correlation range
+        correlation_matrix = torch.clamp(correlation_matrix, min=-1.0, max=1.0)
+    except Exception as e:
+        print(f"Warning: Correlation matrix computation failed: {e}")
+        return torch.eye(D, device=samples.device)
+    return correlation_matrix
+
+
+def relative_correlation_frobenius_distance(corr_target: Tensor, corr_gen: Tensor) -> float:
+    """
+    Computes the Relative Frobenius distance between two correlation matrices.
+    L_rel = || Corr_target - Corr_gen ||_F / || Corr_target ||_F
+    """
+    if corr_target.shape != corr_gen.shape:
+        raise ValueError("Correlation matrices must have the same shape.")
+    target_norm = torch.norm(corr_target, p='fro')
+    diff_norm = torch.norm(corr_target - corr_gen, p='fro')
+    if target_norm < 1e-9:
+        return 0.0 if diff_norm < 1e-9 else float('inf')
+    return (diff_norm / target_norm).item()
 
 # ============================================================================
 # Paper Formatting
@@ -77,7 +124,7 @@ def _plot_marginal_distribution_comparison(
         z0, _ = bridge.flow.forward(z0, torch.zeros(n_viz_particles, 1, device=device))
     else: # Gaussian flow
         mu0, gamma0 = bridge.get_params(torch.tensor([[0.0]], device=device, dtype=torch.float32))
-        z0 = mu0 + gamma0 * z0
+        z0 = (mu0 + gamma0 * z0).to(device)
 
     def forward_ode_func(t, z_np):
         z = torch.from_numpy(z_np).float().to(device).reshape(n_viz_particles, -1)
@@ -95,7 +142,7 @@ def _plot_marginal_distribution_comparison(
         zT, _ = bridge.flow.forward(zT, torch.full((n_viz_particles, 1), T, device=device))
     else:
         muT, gammaT = bridge.get_params(torch.tensor([[T]], device=device, dtype=torch.float32))
-        zT = muT + gammaT * zT
+        zT = (muT + gammaT * zT).to(device)
         
     # Use the provided solver or default to Gaussian
     if solver is None:
@@ -580,9 +627,9 @@ def _visualize_variance_fields_comparison(
     generated_samples: Dict[float, Tensor], 
     output_dir: str
 ):
-    """Visualizes variance field comparison between original and generated samples."""
+    """Visualizes correlation comparison between original and generated samples using diagonal values (self-correlation)."""
     format_for_paper()
-    print("  - Plotting variance fields comparison...")
+    print("  - Plotting correlation fields comparison...")
     
     sorted_times = sorted(marginal_data.keys())
     if not sorted_times:
@@ -596,57 +643,57 @@ def _visualize_variance_fields_comparison(
     resolution = int(math.sqrt(data_dim))
     is_square = (resolution * resolution == data_dim)
 
-    cov_data_list, cov_gen_list, metrics = [], [], {}
+    corr_data_list, corr_gen_list, metrics = [], [], {}
 
     for t_val in selected_times:
         samples_data = marginal_data[t_val].cpu()
         samples_gen = generated_samples[t_val].cpu()
         
-        cov_data = compute_sample_covariance_matrix(samples_data)
-        cov_gen = compute_sample_covariance_matrix(samples_gen)
-        cov_data_list.append(cov_data)
-        cov_gen_list.append(cov_gen)
+        corr_data = compute_sample_correlation_matrix(samples_data)
+        corr_gen = compute_sample_correlation_matrix(samples_gen)
+        corr_data_list.append(corr_data)
+        corr_gen_list.append(corr_gen)
 
-        rel_f_dist = relative_covariance_frobenius_distance(cov_data, cov_gen)
+        rel_f_dist = relative_correlation_frobenius_distance(corr_data, corr_gen)
         metrics[t_val] = {'Rel_F_dist': rel_f_dist}
 
-    # Create variance fields figure - reasonable paper size
+    # Create correlation fields figure - reasonable paper size
     fig_var, axes_var = plt.subplots(2, n_time_points, figsize=(10, 6), sharex=True, sharey=True)
     if n_time_points == 1:
         axes_var = axes_var.reshape(2, 1)
-    fig_var.suptitle("Variance Field Comparison", fontsize=12)
+    fig_var.suptitle("Correlation Field Comparison (Diagonal Elements)", fontsize=12)
 
-    # Compute a global max variance across all times for consistent scale
-    if is_square:
-        max_var = max(torch.diag(c).max().item() for c in cov_data_list + cov_gen_list if c.numel() > 0)
-    else:
-        max_var = None
+    # Note: Correlation diagonal elements are always 1.0 by definition
+    # We'll visualize the off-diagonal mean correlation instead
+    max_corr = 1.0  # Correlation values are bounded [-1, 1]
 
     for i, t_val in enumerate(selected_times):
-        cov_data = cov_data_list[i]
-        cov_gen = cov_gen_list[i]
-        var_data = torch.diag(cov_data)
-        var_gen = torch.diag(cov_gen)
+        corr_data = corr_data_list[i]
+        corr_gen = corr_gen_list[i]
+        # Use mean off-diagonal correlations instead of diagonal (which are always 1)
+        mask = ~torch.eye(corr_data.shape[0], dtype=bool, device=corr_data.device)
+        mean_corr_data = torch.full((corr_data.shape[0],), corr_data[mask].abs().mean().item())
+        mean_corr_gen = torch.full((corr_gen.shape[0],), corr_gen[mask].abs().mean().item())
         
         ax_target = axes_var[0, i]
         ax_gen = axes_var[1, i]
 
         if is_square:
-            # Plot Target Variance (Top Row)
-            arr_data = var_data.reshape(resolution, resolution).numpy()
-            im_target = ax_target.imshow(arr_data, cmap='plasma', vmin=0, vmax=max_var)
+            # Plot Target Mean Correlation (Top Row)
+            arr_data = mean_corr_data.reshape(resolution, resolution).numpy()
+            im_target = ax_target.imshow(arr_data, cmap='plasma', vmin=0, vmax=max_corr)
             
-            # Plot Generated Variance (Bottom Row)
-            arr_gen = var_gen.reshape(resolution, resolution).numpy()
-            im_gen = ax_gen.imshow(arr_gen, cmap='plasma', vmin=0, vmax=max_var)
+            # Plot Generated Mean Correlation (Bottom Row)
+            arr_gen = mean_corr_gen.reshape(resolution, resolution).numpy()
+            im_gen = ax_gen.imshow(arr_gen, cmap='plasma', vmin=0, vmax=max_corr)
             
             # Add individual colorbars for each image
             plt.colorbar(im_target, ax=ax_target, fraction=0.046, pad=0.04)
             plt.colorbar(im_gen, ax=ax_gen, fraction=0.046, pad=0.04)
 
         else: # 1D data case
-            ax_target.plot(var_data.numpy(), label='Target')
-            ax_gen.plot(var_gen.numpy(), '--', label='Generated')
+            ax_target.plot(mean_corr_data.numpy(), label='Target')
+            ax_gen.plot(mean_corr_gen.numpy(), '--', label='Generated')
             ax_gen.set_xlabel("Dimension Index")
             if i == 0:
                 ax_target.legend()
@@ -659,7 +706,7 @@ def _visualize_variance_fields_comparison(
         ax_target.set_title(f"t = {t_val:.2f}\nRel F-Dist = {metrics[t_val]['Rel_F_dist']:.3f}")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "statistical_covariance_variance_fields.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "statistical_correlation_fields.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_var)
 
 
@@ -668,9 +715,9 @@ def _visualize_eigenvalue_spectra_comparison(
     generated_samples: Dict[float, Tensor], 
     output_dir: str
 ):
-    """Visualizes eigenvalue spectra comparison between original and generated samples."""
+    """Visualizes eigenvalue spectra comparison of covariance matrices between original and generated samples."""
     format_for_paper()
-    print("  - Plotting eigenvalue spectra comparison...")
+    print("  - Plotting covariance eigenvalue spectra comparison...")
     
     sorted_times = sorted(marginal_data.keys())
     if not sorted_times:
@@ -684,7 +731,7 @@ def _visualize_eigenvalue_spectra_comparison(
     fig_eig, axes_eig = plt.subplots(1, n_time_points, figsize=(12, 4))
     if n_time_points == 1:
         axes_eig = [axes_eig]
-    fig_eig.suptitle("Eigenvalue Spectrum Comparison", fontsize=12)
+    fig_eig.suptitle("Covariance Matrix Eigenvalue Spectrum Comparison", fontsize=12)
 
     for i, t_val in enumerate(selected_times):
         samples_data = marginal_data[t_val].cpu()
@@ -699,6 +746,7 @@ def _visualize_eigenvalue_spectra_comparison(
             eigvals_gen = torch.linalg.eigvalsh(cov_gen.double())
             eigvals_data = torch.sort(eigvals_data, descending=True)[0].float()
             eigvals_gen = torch.sort(eigvals_gen, descending=True)[0].float()
+            # For covariance matrices, eigenvalues should be non-negative
             eigvals_data = torch.clamp(eigvals_data, min=1e-12)
             eigvals_gen = torch.clamp(eigvals_gen, min=1e-12)
             
@@ -707,12 +755,12 @@ def _visualize_eigenvalue_spectra_comparison(
             ax_eig.set_title(f"t = {t_val:.2f}")
             ax_eig.set_xlabel("Mode Index")
             if i == 0:
-                ax_eig.set_ylabel("Eigenvalue")
+                ax_eig.set_ylabel("Covariance Eigenvalue")
                 ax_eig.legend()
             ax_eig.grid(True, which="both", ls="--", alpha=0.3)
         except Exception as e:
-            print(f"    Warning: Eigenvalue computation failed at t={t_val:.2f}: {e}")
-            ax_eig.text(0.5, 0.5, "Eigenvalue\ncomputation failed", ha='center', va='center', transform=ax_eig.transAxes)
+            print(f"    Warning: Covariance eigenvalue computation failed at t={t_val:.2f}: {e}")
+            ax_eig.text(0.5, 0.5, "Covariance eigenvalue\ncomputation failed", ha='center', va='center', transform=ax_eig.transAxes)
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "statistical_covariance_eigen_spectrum.png"), dpi=300, bbox_inches='tight')
@@ -725,9 +773,9 @@ def _visualize_covariance_heatmaps_comparison(
     output_dir: str,
     max_dim_for_heatmap: int = 2048
 ):
-    """Visualizes covariance heatmaps comparison between original and generated samples."""
+    """Visualizes correlation heatmaps comparison between original and generated samples."""
     format_for_paper()
-    print("  - Plotting covariance heatmaps comparison...")
+    print("  - Plotting correlation heatmaps comparison...")
     
     sorted_times = sorted(marginal_data.keys())
     if not sorted_times:
@@ -742,50 +790,48 @@ def _visualize_covariance_heatmaps_comparison(
     selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
     selected_times = [sorted_times[i] for i in selected_indices]
 
-    global_vmax_cov = 0
+    global_vmax_corr = 1.0  # Correlations are bounded [-1, 1]
     global_vmax_diff = 0
-    cov_data_list, cov_gen_list = [], []
+    corr_data_list, corr_gen_list = [], []
 
     for t_val in selected_times:
         samples_data = marginal_data[t_val].cpu()
         samples_gen = generated_samples[t_val].cpu()
         
-        cov_data = compute_sample_covariance_matrix(samples_data)
-        cov_gen = compute_sample_covariance_matrix(samples_gen)
-        cov_data_list.append(cov_data)
-        cov_gen_list.append(cov_gen)
+        corr_data = compute_sample_correlation_matrix(samples_data)
+        corr_gen = compute_sample_correlation_matrix(samples_gen)
+        corr_data_list.append(corr_data)
+        corr_gen_list.append(corr_gen)
 
-        max_abs_val = max(torch.abs(cov_data).max().item(), torch.abs(cov_gen).max().item())
-        global_vmax_cov = max(global_vmax_cov, max_abs_val)
-        diff = cov_data - cov_gen
+        diff = corr_data - corr_gen
         global_vmax_diff = max(global_vmax_diff, torch.abs(diff).max().item())
 
-    # Create covariance heatmaps figure - reasonable paper size
-    cmap_cov = 'coolwarm'
+    # Create correlation heatmaps figure - reasonable paper size
+    cmap_corr = 'coolwarm'
     cmap_diff = 'RdBu_r'
     fig_hm, axes_hm = plt.subplots(3, n_time_points, figsize=(10, 8))
     if n_time_points == 1:
         axes_hm = axes_hm.reshape(3, 1)
-    fig_hm.suptitle("Covariance Matrix Heatmaps", fontsize=12)
+    fig_hm.suptitle("Correlation Matrix Heatmaps", fontsize=12)
 
     for i, t_val in enumerate(selected_times):
-        cov_data = cov_data_list[i]
-        cov_gen = cov_gen_list[i]
+        corr_data = corr_data_list[i]
+        corr_gen = corr_gen_list[i]
 
         ax_t = axes_hm[0, i]
-        im_target = ax_t.imshow(cov_data.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
+        im_target = ax_t.imshow(corr_data.numpy(), cmap=cmap_corr, vmin=-global_vmax_corr, vmax=global_vmax_corr)
         ax_t.set_title(f"Target\nt = {t_val:.2f}")
         if i == 0:
             ax_t.set_ylabel("Target")
 
         ax_g = axes_hm[1, i]
-        im_gen = ax_g.imshow(cov_gen.numpy(), cmap=cmap_cov, vmin=-global_vmax_cov, vmax=global_vmax_cov)
+        im_gen = ax_g.imshow(corr_gen.numpy(), cmap=cmap_corr, vmin=-global_vmax_corr, vmax=global_vmax_corr)
         ax_g.set_title("Generated")
         if i == 0:
             ax_g.set_ylabel("Generated")
 
         ax_d = axes_hm[2, i]
-        diff = cov_data - cov_gen
+        diff = corr_data - corr_gen
         im_diff = ax_d.imshow(diff.numpy(), cmap=cmap_diff, vmin=-global_vmax_diff, vmax=global_vmax_diff)
         ax_d.set_title("Difference")
         if i == 0:
@@ -797,7 +843,7 @@ def _visualize_covariance_heatmaps_comparison(
         plt.colorbar(im_diff, ax=ax_d, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "statistical_covariance_heatmaps.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, "statistical_correlation_heatmaps.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_hm)
 
 
@@ -808,10 +854,10 @@ def _visualize_statistical_covariance_comparison(
     max_dim_for_heatmap: int = 2048
 ):
     """
-    Wrapper function to generate separate statistical covariance comparison figures:
-    1) Variance fields comparison
-    2) Eigenvalue spectra comparison  
-    3) Covariance heatmaps comparison (optional)
+    Wrapper function to generate separate statistical correlation comparison figures:
+    1) Correlation fields comparison (mean off-diagonal correlations)
+    2) Correlation eigenvalue spectra comparison  
+    3) Correlation heatmaps comparison (optional)
     """
     _visualize_variance_fields_comparison(marginal_data, generated_samples, output_dir)
     _visualize_eigenvalue_spectra_comparison(marginal_data, generated_samples, output_dir)
@@ -847,7 +893,7 @@ def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
         else:  # Expressive flow bridge - sample from learned distribution
             # For expressive flows, we don't have analytical mean/covariance
             # Instead, we'll generate samples and estimate statistics
-            epsilon = bridge.base_dist.sample((samples_k.shape[0],))
+            epsilon = bridge.base_dist.sample((samples_k.shape[0],)).to(device)
             with torch.no_grad():
                 learned_samples, _ = bridge.flow.forward(epsilon, t_k_tensor.expand(samples_k.shape[0], -1))
             learned_samples = learned_samples.cpu().numpy()
@@ -922,7 +968,9 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
     device = next(bridge.parameters()).device
     print("\n--- Generating and Saving Visualizations ---")
     
-    marginal_data_cpu = {t: samples.cpu() for t, samples in marginal_data.items()}
+    # Ensure marginal_data is on the correct device first, then create CPU version for visualization
+    marginal_data_on_device = {t: samples.to(device) for t, samples in marginal_data.items()}
+    marginal_data_cpu = {t: samples.cpu() for t, samples in marginal_data_on_device.items()}
 
     # Determine which solver to use
     if solver == 'euler':
@@ -945,7 +993,7 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
             viz_sample_indices = torch.randperm(marginal_data[final_time].shape[0])[:n_viz_samples]
             
             # Extract the exact same samples that will be used for visualization
-            final_samples_for_viz = marginal_data[final_time][viz_sample_indices]
+            final_samples_for_viz = marginal_data_on_device[final_time][viz_sample_indices].to(device)
             
             # Generate backward samples starting from these exact samples
             print(f"    Using {len(viz_sample_indices)} specific samples for consistent comparison")
@@ -960,18 +1008,19 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
             
             # Create original_data dict using the same sample indices
             original_data = {}
-            for t_val in sorted(marginal_data.keys()):
-                original_data[t_val] = marginal_data[t_val][viz_sample_indices]
+            for t_val in sorted(marginal_data_on_device.keys()):
+                original_data[t_val] = marginal_data_on_device[t_val][viz_sample_indices]
             
             # Convert to CPU for visualization
             original_data_cpu = {t: samples.cpu() for t, samples in original_data.items()}
             ground_truth_backward_cpu = {t: samples.cpu() for t, samples in ground_truth_backward.items()}
             
-            # Denormalize both datasets
+            # Denormalize both datasets (ensure proper device handling)
+            device = next(bridge.parameters()).device
             for t, samples in original_data_cpu.items():
-                original_data_cpu[t] = bridge.denormalize(samples)
+                original_data_cpu[t] = bridge.denormalize(samples.to(device)).cpu()
             for t, samples in ground_truth_backward_cpu.items():
-                ground_truth_backward_cpu[t] = bridge.denormalize(samples)
+                ground_truth_backward_cpu[t] = bridge.denormalize(samples.to(device)).cpu()
 
             # Add visualizations for comparative backward samples (subset)
             # Note: original_data_cpu and ground_truth_backward_cpu were created by
@@ -983,7 +1032,7 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
 
             # For statistically accurate covariance comparisons, use FULL batches
             # anchored at the ground-truth final samples so t=1 covariances are identical.
-            z_final_full_gt = marginal_data[final_time]  # all available GT samples at t=final
+            z_final_full_gt = marginal_data_on_device[final_time].to(device)  # all available GT samples at t=final
             generated_full = generate_backward_samples(
                 bridge, marginal_data,
                 n_samples=z_final_full_gt.shape[0],  # ignored when z_final_ground_truth is provided
@@ -994,15 +1043,15 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
             )
 
             # Prepare full-batch CPU, denormalized
-            marginal_full_cpu = {t: bridge.denormalize(marginal_data[t].cpu()) for t in sorted(marginal_data.keys())}
-            generated_full_cpu = {t: bridge.denormalize(generated_full[t].cpu()) for t in sorted(generated_full.keys())}
+            marginal_full_cpu = {t: bridge.denormalize(marginal_data_on_device[t].to(device)).cpu() for t in sorted(marginal_data_on_device.keys())}
+            generated_full_cpu = {t: bridge.denormalize(generated_full[t].to(device)).cpu() for t in sorted(generated_full.keys())}
 
-            # Covariance comparisons (ACF + full statistical covariance) with full batches
+            # Correlation comparisons (ACF + full statistical correlation) with full batches
             if enable_covariance_analysis:
                 _visualize_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
                 _visualize_statistical_covariance_comparison(marginal_full_cpu, generated_full_cpu, output_dir)
             else:
-                print("Skipping covariance visualizations (enable_covariance_analysis=False).")
+                print("Skipping correlation visualizations (enable_covariance_analysis=False).")
             
         else:
             # ... standard spiral data visualizations
@@ -1225,6 +1274,8 @@ def compute_spatial_acf_2d(samples: Tensor, resolution: int) -> Tensor:
     Computes the normalized spatial ACF for a batch of 2D fields using FFT (Wiener-Khinchin).
     Assumes stationarity, periodicity, and ergodicity.
     """
+    # Ensure computation is done on CPU for visualization
+    samples = samples.cpu()
     B = samples.shape[0]
     fields = samples.reshape(B, resolution, resolution)
 
@@ -1263,10 +1314,11 @@ def radial_average(data_2d: Tensor) -> Tuple[Tensor, Tensor]:
     """
     H, W = data_2d.shape
     center_y, center_x = H // 2, W // 2
+    device = data_2d.device
     
-    # Create coordinate grids
-    y, x = torch.meshgrid(torch.arange(H, device=data_2d.device), 
-                          torch.arange(W, device=data_2d.device), indexing='ij')
+    # Create coordinate grids with explicit device specification
+    y, x = torch.meshgrid(torch.arange(H, device=device, dtype=torch.float32), 
+                          torch.arange(W, device=device, dtype=torch.float32), indexing='ij')
     
     # Calculate radial distance from center
     r = torch.sqrt((x - center_x)**2 + (y - center_y)**2)
@@ -1289,7 +1341,7 @@ def radial_average(data_2d: Tensor) -> Tuple[Tensor, Tensor]:
     avg_in_bin = sum_in_bin / torch.clamp(count_in_bin, min=1)
     
     # Truncate to the meaningful radius
-    radii = torch.arange(max_radius + 1, device=data_2d.device)
+    radii = torch.arange(max_radius + 1, device=device, dtype=torch.float32)
     radial_profile = avg_in_bin[:max_radius + 1]
     
     return radii, radial_profile
