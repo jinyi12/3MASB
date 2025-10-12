@@ -376,13 +376,36 @@ class RBFMetricHandler(nn.Module):
     """
     Handles the learning (Stage 0) and computation of the RBF metric G_RBF(x).
     Implements data-dependent Riemannian metric for improved geodesic computation.
+    
+    Supports both isotropic and anisotropic kernels:
+    
+    ISOTROPIC MODE (default, legacy behavior):
+    - Scalar output h(x) per point (not per-dimension)
+    - Euclidean distances to cluster centers  
+    - Single bandwidth per cluster across all dimensions
+    - Diagonal metric tensor: M_ii = 1/(h(x) + epsilon)^alpha
+    
+    ANISOTROPIC MODE (new, dimension-aware):
+    - Vector output h(x) with per-dimension values
+    - Per-dimension bandwidths: lambda_k_d = 0.5 / ((kappa * sigma_k_d)**2 + 1e-6)
+    - Mahalanobis-like distance: sum_d(lambda_k_d * (x_d - c_k_d)^2)
+    - Diagonal metric tensor: M_ii(x) = 1/(h_i(x) + epsilon)^alpha (different per dimension)
+    
+    Reference: https://github.com/kksniak/metric-flow-matching/blob/main/mfm/geo_metrics/rbf.py
+    
+    CRITICAL: Trained on original data space but applied to normalized data.
     """
-    def __init__(self, data_dim: int, num_clusters: int = 50, epsilon: float = 1e-3, device: str = 'cpu'):
+    def __init__(self, data_dim: int, num_clusters: int = 50, epsilon: float = 1e-3, 
+                 alpha: float = 1.0, device: str = 'cpu',
+                 data_mean: torch.Tensor = None, data_std: torch.Tensor = None,
+                 anisotropic: bool = False):
         super().__init__()
         self.D = data_dim
         self.K = num_clusters
         self.epsilon = epsilon
+        self.alpha = alpha  # Steepness parameter for metric tensor
         self.device = device
+        self.anisotropic = anisotropic  # Control isotropic vs anisotropic behavior
         
         # Learnable weights w_k,d. Use softplus for positivity.
         self.raw_weights = nn.Parameter(torch.zeros(self.K, self.D))
@@ -391,8 +414,30 @@ class RBFMetricHandler(nn.Module):
         self.register_buffer('centers', torch.zeros(self.K, self.D))
         self.register_buffer('bandwidths', torch.ones(self.K, self.D))
         self.is_initialized = False
+        
+        # CRITICAL FIX: Store normalization parameters for space transformation
+        if data_mean is not None and data_std is not None:
+            self.register_buffer('data_mean', data_mean.to(device))
+            self.register_buffer('data_std', data_std.to(device))
+            self.has_normalization = True
+        else:
+            self.register_buffer('data_mean', torch.zeros(data_dim, device=device))
+            self.register_buffer('data_std', torch.ones(data_dim, device=device))
+            self.has_normalization = False
 
-    def initialize_from_data(self, dataset: torch.Tensor, kappa: float = 1.0):
+    def _denormalize(self, x_normalized: torch.Tensor) -> torch.Tensor:
+        """Transform normalized data back to original space for metric computation."""
+        if not self.has_normalization:
+            return x_normalized
+        return x_normalized * self.data_std + self.data_mean
+
+    def _normalize(self, x_original: torch.Tensor) -> torch.Tensor:
+        """Transform original data to normalized space."""
+        if not self.has_normalization:
+            return x_original
+        return (x_original - self.data_mean) / self.data_std
+
+    def initialize_from_data(self, dataset: torch.Tensor, kappa: float = 1.0, image_data: bool = True):
         """Stage 0a: Initialize centers using k-means and calculate bandwidths."""
         if dataset.dim() > 2:
             dataset = dataset.view(dataset.shape[0], -1)
@@ -400,81 +445,218 @@ class RBFMetricHandler(nn.Module):
         N, D = dataset.shape
 
         # 1. K-Means Clustering
-        if KMeans is not None:
-            # Use sklearn KMeans
-            dataset_np = dataset.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=self.K, random_state=42, n_init=10)
-            kmeans.fit(dataset_np)
-            centers = torch.tensor(kmeans.cluster_centers_, device=self.device, dtype=dataset.dtype)
-            labels = torch.tensor(kmeans.labels_, device=self.device)
-        else:
-            # Fallback: random initialization with improved spreading
-            print("Warning: sklearn not available. Using random initialization for RBF centers.")
-            # Choose centers from data points for better initialization
-            indices = torch.randperm(N, device=self.device)[:self.K]
-            centers = dataset[indices].clone()
-            
-            # Assign labels based on nearest centers
-            distances = torch.cdist(dataset, centers)
-            labels = torch.argmin(distances, dim=1)
+        if KMeans is None:
+            raise ImportError("scikit-learn is required for RBF initialization. Please install it.")
+        
+        dataset_np = dataset.detach().cpu().numpy()
+        kmeans = KMeans(n_clusters=self.K, random_state=42, n_init=10)
+        kmeans.fit(dataset_np)
+        centers = torch.tensor(kmeans.cluster_centers_, device=self.device, dtype=dataset.dtype)
+        labels = torch.tensor(kmeans.labels_, device=self.device)
 
         self.centers.copy_(centers)
 
-        # 2. Calculate Bandwidths (lambda_k,d)
-        bandwidths = torch.ones_like(centers)
+        # 2. Calculate Bandwidths
+        # Reference: https://github.com/kksniak/metric-flow-matching/blob/main/mfm/geo_metrics/rbf.py
         
-        for k in range(self.K):
-            mask = (labels == k)
-            if mask.sum() > 1:
-                cluster_data = dataset[mask]
-                # Calculate variance for each dimension
-                cluster_var = torch.var(cluster_data, dim=0, unbiased=True)
-                # Bandwidth = kappa * sqrt(variance), with minimum threshold
-                bandwidths[k] = kappa * torch.sqrt(cluster_var + 1e-6)
-            else:
-                # Single point or empty cluster: use default bandwidth
-                bandwidths[k] = kappa * torch.ones(D, device=self.device)
-
-        self.bandwidths.copy_(bandwidths)
+        if self.anisotropic:
+            # ANISOTROPIC MODE: Store per-dimension bandwidths (K, D)
+            bandwidths = torch.ones(self.K, self.D, device=self.device, dtype=dataset.dtype)
+            
+            for k in range(self.K):
+                mask = (labels == k)
+                if mask.sum() > 1:
+                    cluster_data = dataset[mask]
+                    # Variance per dimension relative to the cluster center
+                    cluster_var_per_dim = torch.mean((cluster_data - self.centers[k])**2, dim=0)  # (D,)
+                    
+                    # Calculate per-dimension standard deviations
+                    sigma_k_d = torch.sqrt(cluster_var_per_dim + 1e-8)  # (D,)
+                    
+                    # Calculate per-dimension bandwidths: lambda_k_d = 0.5 / ((kappa * sigma_k_d)^2 + 1e-6)
+                    lambda_k_d = 0.5 / ((kappa * sigma_k_d)**2 + 1e-6)  # (D,)
+                    
+                    bandwidths[k] = lambda_k_d
+                else:
+                    # Fallback for single-point or empty clusters
+                    bandwidths[k] = 1.0
+            
+            self.bandwidths.copy_(bandwidths)
+            print(f"RBF metric initialized with {self.K} clusters (ANISOTROPIC mode).")
+            
+        else:
+            # ISOTROPIC MODE: Scalar bandwidth per cluster, broadcast to all dimensions
+            bandwidths = torch.ones(self.K, 1, device=self.device, dtype=dataset.dtype)
+            
+            for k in range(self.K):
+                mask = (labels == k)
+                if mask.sum() > 1:
+                    cluster_data = dataset[mask]
+                    # Variance per dimension relative to the cluster center
+                    cluster_var_per_dim = torch.mean((cluster_data - self.centers[k])**2, dim=0) # (D,)
+                    
+                    # Aggregate variance to a scalar sigma
+                    if image_data:
+                        # For image data, sum variances across dimensions
+                        total_variance = cluster_var_per_dim.sum()
+                    else:
+                        # For other data, mean variance across dimensions
+                        total_variance = cluster_var_per_dim.mean()
+                    
+                    sigma_k = torch.sqrt(total_variance)
+                    
+                    # Calculate scalar bandwidth (precision) lambda_k = 1 / (2 * (kappa * sigma_k)^2)
+                    lambda_k = 0.5 / ((kappa * sigma_k)**2 + 1e-6)
+                    
+                    bandwidths[k] = lambda_k
+                else:
+                    # Fallback for single-point or empty clusters
+                    bandwidths[k] = 1.0
+            
+            # Store as (K,1) and broadcast it in compute_h
+            # To maintain compatibility with raw_weights (K,D), we expand it
+            self.bandwidths.copy_(bandwidths.expand(-1, self.D))
+            print(f"RBF metric initialized with {self.K} clusters (ISOTROPIC mode).")
+        
         self.is_initialized = True
-        print(f"RBF metric initialized with {self.K} clusters.")
 
     def compute_h(self, x_flat: torch.Tensor) -> torch.Tensor:
-        # 1. Compute element-wise squared distance (B, K, D)
-        sq_dist = (x_flat.unsqueeze(1) - self.centers.unsqueeze(0))**2
+        """
+        Computes the RBF network output h(x).
         
-        # 2. Scale by element-wise precisions (Anisotropic bandwidths)
-        # self.bandwidths acts as the precision Lambda (K, D)
-        scaled_sq_dist = sq_dist * self.bandwidths.unsqueeze(0) # (B, K, D)
-
-        # 3. CRITICAL CHANGE: Sum over dimensions D (Mahalanobis distance)
-        multivariate_scaled_dist = torch.sum(scaled_sq_dist, dim=2) # (B, K)
-
-        # 4. Compute multivariate kernel
-        rbf_kernel = torch.exp(-0.5 * multivariate_scaled_dist) # (B, K)
-
-        # 5. Apply weights (K, D) and sum over clusters
-        weights = F.softplus(self.raw_weights) 
-        # Broadcast kernel (B, K, 1) * weights (1, K, D)
-        h_x = torch.sum(rbf_kernel.unsqueeze(2) * weights.unsqueeze(0), dim=1) # (B, D)
+        ISOTROPIC MODE: Returns scalar h(x) broadcast to all dimensions.
+        ANISOTROPIC MODE: Returns vector h(x) with per-dimension values.
+        
+        Reference: https://github.com/kksniak/metric-flow-matching/blob/main/mfm/geo_metrics/rbf.py
+        """
+        if self.anisotropic:
+            # ANISOTROPIC MODE: Compute per-dimension h(x)
+            # 1. Element-wise squared distance: (B, K, D)
+            sq_dist = (x_flat.unsqueeze(1) - self.centers.unsqueeze(0))**2  # Shape: [B, K, D]
+            
+            # 2. Apply anisotropic bandwidths (per-dimension precision)
+            # self.bandwidths is (K, D) with potentially different values per dimension
+            scaled_sq_dist = sq_dist * self.bandwidths.unsqueeze(0)  # Shape: [B, K, D]
+            
+            # # 3. Sum over dimensions to get anisotropic (Mahalanobis-like) distance
+            # anisotropic_dist = torch.sum(scaled_sq_dist, dim=2)  # Shape: [B, K]
+            # sum causes underflow and vanishing gradients
+            anisotropic_dist = torch.mean(scaled_sq_dist, dim=2)  # Shape: [B, K]
+            
+            # 4. Compute RBF kernel values
+            rbf_kernel = torch.exp(-anisotropic_dist)  # Shape: [B, K]
+            
+            # 5. Apply per-dimension weights (K, D)
+            # self.raw_weights is (K, D), apply softplus for positivity
+            weights = F.softplus(self.raw_weights)  # Shape: (K, D)
+            
+            # 6. Compute weighted sum to get per-dimension output h(x)
+            # rbf_kernel: (B, K), weights: (K, D)
+            # We want: sum_k rbf_kernel[b,k] * weights[k,d] for each dimension d
+            h_x = torch.einsum('bk,kd->bd', rbf_kernel, weights)  # Shape: (B, D)
+            
+        else:
+            # ISOTROPIC MODE: Compute scalar h(x) and broadcast
+            # 1. Compute squared Euclidean distance to centers (B, K)
+            sq_dist = torch.cdist(x_flat, self.centers) ** 2
+            
+            # 2. Get scalar bandwidths (precision) per cluster (K,)
+            # self.bandwidths is (K, D) with identical values per row. Take the first column.
+            scalar_bandwidths = self.bandwidths[:, 0]  # Shape: (K,)
+            
+            # 3. Apply scalar bandwidths to scalar distances
+            # (B, K) * (K,) -> (B, K)
+            scaled_sq_dist = sq_dist * scalar_bandwidths.unsqueeze(0)
+            
+            # 4. Compute RBF kernel values (phi_x in reference)
+            rbf_kernel = torch.exp(-scaled_sq_dist)  # Shape: (B, K)
+            
+            # 5. Get scalar weights per cluster (W in reference)
+            # self.raw_weights is (K, D). We average to get a scalar weight per cluster.
+            scalar_weights = F.softplus(self.raw_weights).mean(dim=1)  # Shape: (K,)
+            
+            # 6. Weighted sum to get a SCALAR output h(x) per data point
+            # (B, K) * (K,) -> sum over K -> (B,)
+            h_x_scalar = torch.sum(rbf_kernel * scalar_weights.unsqueeze(0), dim=1)
+            
+            # 7. Broadcast scalar h(x) to match the data dimension (D)
+            # This is for constructing the diagonal metric where each diagonal element is the same.
+            h_x = h_x_scalar.unsqueeze(1).expand(-1, x_flat.shape[1])  # Shape: (B, D)
+        
         return h_x
 
-    def compute_metric(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute the diagonal RBF metric G_RBF(x) = (h(x) + epsilon)^-1."""
+    def compute_metric(self, x: torch.Tensor, alpha: float = None) -> torch.Tensor:
+        """Compute the diagonal RBF metric G_RBF(x) = (h(x) + epsilon)^(-alpha).
+        
+        Following the authors' formulation where alpha controls the steepness of the metric tensor.
+        Higher alpha makes the metric more sensitive to deviations from data points.
+        
+        ISOTROPIC MODE: h(x) is scalar, broadcast to all dimensions (M_ii identical)
+        ANISOTROPIC MODE: h(x) is vector, different M_ii per dimension
+        
+        Reference: https://github.com/kksniak/metric-flow-matching/blob/main/mfm/geo_metrics/rbf.py#L143-152
+        
+        Args:
+            x: Input tensor (in normalized space if normalization is used)
+            alpha: Steepness parameter. If None, uses instance alpha. Authors sometimes use different values.
+            
+        Returns:
+            Diagonal metric tensor with shape matching input
+            
+        CRITICAL: x is in normalized space, but metric is computed in original space.
+        """
+        # Use instance alpha if not specified
+        if alpha is None:
+            alpha = self.alpha
+            
         original_shape = x.shape
         B = x.shape[0]
-        x_flat = x.view(B, -1)
-        h_x = self.compute_h(x_flat)
-        metric_diag = 1.0 / (h_x + self.epsilon)
+        x_flat_normalized = x.view(B, -1)
+        
+        # CRITICAL FIX: Transform to original space for metric computation
+        x_flat_original = self._denormalize(x_flat_normalized)
+        
+        # Compute RBF network output h(x)
+        # ISOTROPIC: (B, D) with identical values per row
+        # ANISOTROPIC: (B, D) with different values per dimension
+        h_x = self.compute_h(x_flat_original)
+        
+        # assume image data, following authors
+        h_x = 1 - torch.abs(1 - h_x)
+        
+        # Authors' metric formula: M(x) = 1 / (h(x) + epsilon)^alpha
+        metric_diag = 1.0 / (h_x + self.epsilon) ** alpha
+        
+        # IMPORTANT: Scale metric by normalization factor
+        # The metric should be scaled by 1/std^2 to account for coordinate scaling
+        if self.has_normalization:
+            std_scaling = self.data_std.view(1, -1) ** 2
+            metric_diag = metric_diag * (std_scaling + 1e-8)
+        
         return metric_diag.view(original_shape)
+        
+        # BACKWARD COMPATIBILITY: Original approach (commented)
+        # Original approach without alpha parameter:
+        # metric_diag = 1.0 / (h_x + self.epsilon)
+        # 
+        # This corresponds to alpha=1.0 in the authors' formulation
 
     def train_metric(self, dataset: torch.Tensor, epochs: int = 100, lr: float = 1e-3):
-        """Stage 0b: Train weights w_k,d to enforce h(x_i) ≈ 1."""
+        """Stage 0b: Train weights w_k,d to enforce h(x_i) ≈ 1.
+        
+        ISOTROPIC MODE: Trains to make scalar h(x) ≈ 1
+        ANISOTROPIC MODE: Trains to make per-dimension h_d(x) ≈ 1
+        
+        Args:
+            dataset: Training data
+            epochs: Number of training epochs
+            lr: Learning rate
+        """
         if not self.is_initialized:
             raise RuntimeError("Must initialize RBF metric before training.")
-            
-        print(f"Training RBF metric for {epochs} epochs...")
-        
+
+        mode_str = "ANISOTROPIC" if self.anisotropic else "ISOTROPIC"
+        print(f"Training RBF metric ({mode_str} mode) for {epochs} epochs...")
         if dataset.dim() > 2:
             dataset = dataset.view(dataset.shape[0], -1)
             
@@ -485,11 +667,36 @@ class RBFMetricHandler(nn.Module):
             optimizer.zero_grad()
             
             # Compute h(x) for all data points
-            h_x = self.compute_h(dataset)  # (N, D)
+            # ISOTROPIC: (N, D) with identical values per row
+            # ANISOTROPIC: (N, D) with different values per dimension
+            h_x = self.compute_h(dataset)
             
-            # Loss: enforce h(x_i) ≈ 1 for all dimensions
-            target = torch.ones_like(h_x)
-            loss = F.mse_loss(h_x, target)
+            if self.anisotropic:
+                # ANISOTROPIC: Monitor per-dimension statistics
+                if epoch % (epochs // 5) == 0:
+                    h_x_mean_per_dim = h_x.mean(dim=0)  # (D,) - mean h for each dimension
+                    print(f"  h(x) per-dim mean: min={h_x_mean_per_dim.min().item():.4f}, "
+                          f"max={h_x_mean_per_dim.max().item():.4f}, "
+                          f"avg={h_x_mean_per_dim.mean().item():.4f}")
+                    print(f"  h(x) overall: mean={h_x.mean().item():.4f}, "
+                          f"std={h_x.std().item():.4f}")
+                
+                # Loss: enforce h_d(x_i) ≈ 1 for all dimensions
+                target = torch.ones_like(h_x)
+                loss = F.mse_loss(h_x, target)
+            else:
+                # ISOTROPIC: Monitor scalar h(x) values (take first dimension since all are identical)
+                h_x_scalar = h_x[:, 0]  # (N,) - scalar values
+                
+                if epoch % (epochs // 5) == 0:
+                    print(f"  h(x) stats: mean={h_x_scalar.mean().item():.4f}, "
+                          f"std={h_x_scalar.std().item():.4f}, "
+                          f"min={h_x_scalar.min().item():.4f}, "
+                          f"max={h_x_scalar.max().item():.4f}")
+                
+                # Loss: enforce h(x_i) ≈ 1 (scalar target)
+                target_scalar = torch.ones_like(h_x_scalar)
+                loss = F.mse_loss(h_x_scalar, target_scalar)
             
             loss.backward()
             optimizer.step()
@@ -499,6 +706,15 @@ class RBFMetricHandler(nn.Module):
         
         self.eval()
         print("RBF metric training completed.")
+        if self.anisotropic:
+            print(f"Final h(x) mean: {h_x.mean().item():.4f}, target=1.0 (per dimension)")
+        else:
+            print(f"Final h(x) mean: {h_x_scalar.mean().item():.4f}, target=1.0")
+
+        # BACKWARD COMPATIBILITY: Original per-dimension training approach (commented)
+        # Original approach monitored h_x.mean(dim=0) and used per-dimension targets:
+        # target = torch.ones_like(h_x)  # (N, D) target
+        # loss = F.mse_loss(h_x, target)  # Per-dimension MSE
 
 
 # =============================================================================
@@ -669,60 +885,93 @@ def trajectory_matching_loss(
     else:
         # Standard MSE loss (Euclidean metric)
         loss = F.mse_loss(predicted_velocity, target_velocity, reduction='mean')
+    # loss = F.mse_loss(predicted_velocity, target_velocity, reduction='mean')
     
     return loss
 
+
+# def consistency_loss(
+#     v_theta_model: VelocityNetwork,
+#     U_phi_model: EnergyNetwork,
+#     x_t: torch.Tensor,
+#     s_t: torch.Tensor,
+#     metric_handler: Optional[RBFMetricHandler] = None
+# ) -> torch.Tensor:
+#     """
+#     L_CE (DSM aspect): Enforces the Continuity Equation in energy form:
+#     partial_s U_phi = nabla_x . v_theta - <v_theta, nabla_x U_phi>
+    
+#     If metric_handler is provided, the loss is weighted by the RBF metric g(x_t, η*):
+#     L = E[ g(x_t, η*) * || partial_s U_phi - (nabla_x . v_theta - <v_theta, nabla_x U_phi>) ||^2 ]
+#     """
+    
+#     # 1. Compute Spatial and Scale Scores (Requires gradients)
+#     spatial_score, scale_score = U_phi_model.compute_scores(x_t, s_t)
+    
+#     # 2. Compute Divergence and Velocity (Requires gradients)
+#     # The returned velocity tracks gradients necessary for the coupled optimization.
+#     divergence, velocity = v_theta_model.compute_divergence(x_t, s_t)
+
+#     # 3. Compute the transport/convection term: <v_theta, nabla_x U_phi>
+#     dims = tuple(range(1, x_t.ndim))
+#     # Output shape: (B, 1)
+#     transport_term = torch.sum(velocity * spatial_score, dim=dims, keepdim=True)
+    
+#     # 4. Calculate the Spatial Dynamics component (RHS): (nabla_x . v - <v, nabla_x U>)
+#     spatial_dynamics = divergence - transport_term
+    
+#     # 5. Compute the loss (MSE between LHS and RHS)
+#     # This involves double backpropagation.
+#     assert scale_score.shape == spatial_dynamics.shape
+    
+#     if metric_handler is not None:
+#         # Weight the loss by the RBF metric g(x_t, η*)
+#         # Note: scale_score and spatial_dynamics have shape (B, 1), so we need the flattened metric
+#         x_t_flat = x_t.view(x_t.shape[0], -1)
+#         metric_weights_flat = metric_handler.compute_h(x_t_flat)  # Shape: (B, D_flat)
+#         # Take mean over spatial dimensions to get scalar weight per sample
+#         metric_weights_scalar = metric_weights_flat.mean(dim=1, keepdim=True)  # Shape: (B, 1)
+        
+#         # Apply metric weighting
+#         residual = scale_score - spatial_dynamics  # Shape: (B, 1)
+#         weighted_residual_squared = metric_weights_scalar * (residual ** 2)
+#         loss = weighted_residual_squared.mean()
+#     else:
+#         # Standard MSE loss (Euclidean metric)
+#         loss = F.mse_loss(scale_score, spatial_dynamics, reduction='mean')
+    
+#     return loss
 
 def consistency_loss(
     v_theta_model: VelocityNetwork,
     U_phi_model: EnergyNetwork,
     x_t: torch.Tensor,
     s_t: torch.Tensor,
+    # CRITICAL: Add target velocity from MFM for stabilization
+    target_velocity: torch.Tensor, 
     metric_handler: Optional[RBFMetricHandler] = None
 ) -> torch.Tensor:
-    """
-    L_CE (DSM aspect): Enforces the Continuity Equation in energy form:
-    partial_s U_phi = nabla_x . v_theta - <v_theta, nabla_x U_phi>
     
-    If metric_handler is provided, the loss is weighted by the RBF metric g(x_t, η*):
-    L = E[ g(x_t, η*) * || partial_s U_phi - (nabla_x . v_theta - <v_theta, nabla_x U_phi>) ||^2 ]
-    """
-    
-    # 1. Compute Spatial and Scale Scores (Requires gradients)
+    # 1. Compute Scores and Divergence
     spatial_score, scale_score = U_phi_model.compute_scores(x_t, s_t)
-    
-    # 2. Compute Divergence and Velocity (Requires gradients)
-    # The returned velocity tracks gradients necessary for the coupled optimization.
-    divergence, velocity = v_theta_model.compute_divergence(x_t, s_t)
+    divergence, _ = v_theta_model.compute_divergence(x_t, s_t)
 
-    # 3. Compute the transport/convection term: <v_theta, nabla_x U_phi>
+    # 2. Compute Stabilized Transport term: <target_velocity, nabla_x U_phi>
     dims = tuple(range(1, x_t.ndim))
-    # Output shape: (B, 1)
-    transport_term = torch.sum(velocity * spatial_score, dim=dims, keepdim=True)
+    # Use the fixed MFM velocity (detached for safety)
+    stabilized_transport_term = torch.sum(target_velocity.detach() * spatial_score, dim=dims, keepdim=True)
     
-    # 4. Calculate the Spatial Dynamics component (RHS): (nabla_x . v - <v, nabla_x U>)
-    spatial_dynamics = divergence - transport_term
+    # 3. Calculate the ICoV residual: 
+    # LHS: Total time derivative (d/dt U = partial_s U + target_velocity . nabla_x U)
+    total_time_derivative = scale_score + stabilized_transport_term
     
-    # 5. Compute the loss (MSE between LHS and RHS)
-    # This involves double backpropagation.
-    assert scale_score.shape == spatial_dynamics.shape
+    # RHS: Divergence of the parameterized velocity
+    spatial_dynamics = divergence
     
-    if metric_handler is not None:
-        # Weight the loss by the RBF metric g(x_t, η*)
-        # Note: scale_score and spatial_dynamics have shape (B, 1), so we need the flattened metric
-        x_t_flat = x_t.view(x_t.shape[0], -1)
-        metric_weights_flat = metric_handler.compute_h(x_t_flat)  # Shape: (B, D_flat)
-        # Take mean over spatial dimensions to get scalar weight per sample
-        metric_weights_scalar = metric_weights_flat.mean(dim=1, keepdim=True)  # Shape: (B, 1)
-        
-        # Apply metric weighting
-        residual = scale_score - spatial_dynamics  # Shape: (B, 1)
-        weighted_residual_squared = metric_weights_scalar * (residual ** 2)
-        loss = weighted_residual_squared.mean()
-    else:
-        # Standard MSE loss (Euclidean metric)
-        loss = F.mse_loss(scale_score, spatial_dynamics, reduction='mean')
-    
+    # 4. Compute the loss (MSE between LHS and RHS)
+    # Dont need the weighting because we are matching energies directly
+    loss = F.mse_loss(total_time_derivative, spatial_dynamics, reduction='mean')
+
     return loss
 
 
@@ -797,7 +1046,7 @@ def training_step_ccvep(
     # 3. Consistency Loss (L_CE)
     # Updates v_theta and U_phi.
     # Note: The loss functions internally handle the required gradients wrt x_t via cloning.
-    loss_consistency = consistency_loss(v_theta_model, U_phi_model, x_t, s_t, metric_handler)
+    loss_consistency = consistency_loss(v_theta_model, U_phi_model, x_t, s_t, target_v_t, metric_handler)
 
     # Total Loss: L = L_Traj + lambda_CE * L_CE
     total_loss = loss_trajectory + lambda_CE * loss_consistency
