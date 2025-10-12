@@ -139,6 +139,50 @@ def relative_covariance_frobenius_distance(cov_target: Tensor, cov_gen: Tensor) 
     return (diff_norm / target_norm).item()
 
 
+def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
+    """
+    Computes the full DxD sample correlation matrix for a batch of samples.
+    Args:
+        samples: Tensor of shape [N, D] (N samples, D dimensions).
+    Returns:
+        Correlation matrix of shape [D, D].
+    """
+    N, D = samples.shape
+    if N <= 1:
+        print(f"Warning: Insufficient samples (N={N}) to compute correlation. Returning identity matrix.")
+        return torch.eye(D, device=samples.device)
+    try:
+        # Compute covariance matrix first
+        cov_matrix = torch.cov(samples.T)
+        # Extract standard deviations
+        std_devs = torch.sqrt(torch.diag(cov_matrix))
+        # Handle zero standard deviations
+        std_devs = torch.clamp(std_devs, min=1e-9)
+        # Compute correlation matrix: Corr = D^(-1/2) * Cov * D^(-1/2)
+        inv_std = 1.0 / std_devs
+        correlation_matrix = cov_matrix * inv_std.unsqueeze(0) * inv_std.unsqueeze(1)
+        # Clamp to valid correlation range
+        correlation_matrix = torch.clamp(correlation_matrix, min=-1.0, max=1.0)
+    except Exception as e:
+        print(f"Warning: Correlation matrix computation failed: {e}")
+        return torch.eye(D, device=samples.device)
+    return correlation_matrix
+
+
+def relative_correlation_frobenius_distance(corr_target: Tensor, corr_gen: Tensor) -> float:
+    """
+    Computes the Relative Frobenius distance between two correlation matrices.
+    L_rel = || Corr_target - Corr_gen ||_F / || Corr_target ||_F
+    """
+    if corr_target.shape != corr_gen.shape:
+        raise ValueError("Correlation matrices must have the same shape.")
+    target_norm = torch.norm(corr_target, p='fro')
+    diff_norm = torch.norm(corr_target - corr_gen, p='fro')
+    if target_norm < 1e-9:
+        return 0.0 if diff_norm < 1e-9 else float('inf')
+    return (diff_norm / target_norm).item()
+
+
 # ============================================================================
 # Quantitative Validation Metrics
 # ============================================================================
@@ -152,7 +196,7 @@ def calculate_validation_metrics(marginal_data: Dict[float, Tensor], generated_s
         'times': sorted_times,
         'w2_distances': [],
         'mse_acf': [],
-        'rel_fro_cov': [],
+        'rel_fro_cov': [],  # Now contains correlation metrics but keeping same key for compatibility
     }
 
     # Determine resolution
@@ -193,17 +237,17 @@ def calculate_validation_metrics(marginal_data: Dict[float, Tensor], generated_s
                 print(f"    Warning: MSE ACF calculation failed at t={t_val:.2f}: {e}")
         metrics['mse_acf'].append(mse_acf)
 
-        # 3. Full covariance comparison metrics (works for any D)
+        # 3. Full correlation comparison metrics (works for any D)
         try:
-            cov_data = compute_sample_covariance_matrix(target_data_cpu)
-            cov_gen = compute_sample_covariance_matrix(gen_data_cpu)
-            rel_f = relative_covariance_frobenius_distance(cov_data, cov_gen)
-            metrics['rel_fro_cov'].append(rel_f)
+            corr_data = compute_sample_correlation_matrix(target_data_cpu)
+            corr_gen = compute_sample_correlation_matrix(gen_data_cpu)
+            rel_f = relative_correlation_frobenius_distance(corr_data, corr_gen)
+            metrics['rel_fro_cov'].append(rel_f)  # Note: keeping same key for compatibility
 
         except Exception as e:
-            print(f"    Warning: Covariance metric calculation failed at t={t_val:.2f}: {e}")
+            print(f"    Warning: Correlation metric calculation failed at t={t_val:.2f}: {e}")
             metrics['rel_fro_cov'].append(float('nan'))
-        print(f"    t={t_val:.2f}: W2={w2_dist:.4f}, MSE_ACF={mse_acf:.4e}, RelF(Cov)={metrics['rel_fro_cov'][-1]:.4f}")
+        print(f"    t={t_val:.2f}: W2={w2_dist:.4f}, MSE_ACF={mse_acf:.4e}, RelF(Corr)={metrics['rel_fro_cov'][-1]:.4f}")
 
     return metrics
 
