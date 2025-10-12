@@ -376,23 +376,34 @@ class NeuralBridgeExpressive(nn.Module):
 
 def train_glow_bridge(
     bridge: NeuralBridgeExpressive,
-    marginal_data: Dict[float, torch.Tensor],
+    marginal_data: Dict[float, torch.Tensor] = None,
+    paired_data: Dict[float, torch.Tensor] = None,
+    loss_config: Dict = None,
     epochs: int = 2000,
     lr: float = 5e-4,
-    lambda_path: float = 0.01,
     weight_decay: float = 1e-4,
     use_scheduler: bool = True,
     grad_clip_norm: float = 1.0,
     verbose: bool = True,
 ) -> list:
     """
-    Train the GLOW-based expressive bridge using MLE and path regularization.
-    Uses modularized loss functions for clarity and maintainability.
+    Unified GLOW bridge training with configurable loss composition.
+    
+    This replaces separate training functions by using dynamic loss composition.
+    
+    Examples:
+        Standard MLE: train_glow_bridge(bridge, marginal_data=data)
+        LCL training: train_glow_bridge(bridge, paired_data=paired, 
+                                        loss_config={'consistency_mode': 'mean'})
     """
     from tqdm import trange
 
     # Initialize modular losses
     losses = BridgeLosses(bridge)
+    
+    # Default loss configuration
+    if loss_config is None:
+        loss_config = {'lambda_path': 0.01}
     
     # Use AdamW for decoupled weight decay
     optimizer = torch.optim.AdamW(bridge.parameters(), lr=lr, weight_decay=weight_decay)
@@ -414,96 +425,14 @@ def train_glow_bridge(
     for epoch in pbar:
         optimizer.zero_grad()
 
-        # Compute loss using modular function
-        total_loss, mle_loss, path_loss = losses.standard_loss(
-            marginal_data, lambda_path=lambda_path
-        )
-
-        total_loss.backward()
-
-        # Apply gradient clipping
-        if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(bridge.parameters(), max_norm=grad_clip_norm)
-
-        optimizer.step()
-
-        # Update learning rate
-        if scheduler:
-            scheduler.step()
-
-        loss_history.append(
-            {
-                "total": total_loss.item(),
-                "mle": mle_loss.item(),
-                "path": path_loss.item(),
-            }
-        )
-
-        if verbose and isinstance(pbar, type(trange(0))):
-            current_lr = optimizer.param_groups[0]["lr"]
-            pbar.set_description(
-                f"Loss: {total_loss.item():.4f} (MLE: {mle_loss.item():.4f}, Path: {path_loss.item():.4f}) LR: {current_lr:.2e}"
-            )
-
-    bridge.eval()
-    return loss_history
-
-
-def train_glow_bridge_atr(
-    bridge: NeuralBridgeExpressive,
-    marginal_data: Dict[float, torch.Tensor],
-    epochs: int = 2000,
-    lr: float = 5e-4,
-    lambda_recon: float = 1.0,
-    lambda_smooth: float = 0.001,
-    lambda_path: float = 0.0,
-    n_trajectories: int = 512,  # Number of paired trajectories
-    weight_decay: float = 1e-4,
-    use_scheduler: bool = True,
-    grad_clip_norm: float = 1.0,
-    verbose: bool = True,
-) -> list:
-    """
-    Train the GLOW-based bridge using the Anchored Trajectory Reconstruction (ATR) objective.
-    Uses modularized loss functions for clarity and maintainability.
-    """
-    from tqdm import trange
-
-    # Initialize modular losses
-    losses = BridgeLosses(bridge)
-    
-    # Create paired trajectory data
-    paired_data = create_paired_trajectories(marginal_data, n_trajectories)
-
-    # Use AdamW for decoupled weight decay
-    optimizer = torch.optim.AdamW(bridge.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # Initialize Scheduler
-    scheduler = None
-    if use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    loss_history = []
-
-    if verbose:
-        pbar = trange(epochs)
-    else:
-        pbar = range(epochs)
-
-    bridge.train()  # Ensure model is in training mode
-
-    for epoch in pbar:
-        optimizer.zero_grad()
-
-        # Compute ATR loss using modular function
-        total_loss, primary_loss, reg_loss = losses.atr_loss(
+        # Compute loss using unified method
+        loss_dict = losses.compute_loss(
+            marginal_data=marginal_data,
             paired_data=paired_data,
-            lambda_recon=lambda_recon,
-            lambda_smooth=lambda_smooth,
-            lambda_path=lambda_path,
+            loss_config=loss_config,
         )
 
-        total_loss.backward()
+        loss_dict['total'].backward()
 
         # Apply gradient clipping
         if grad_clip_norm > 0:
@@ -515,104 +444,27 @@ def train_glow_bridge_atr(
         if scheduler:
             scheduler.step()
 
-        loss_history.append(
-            {
-                "total": total_loss.item(),
-                "primary": primary_loss.item(),  # MLE + Reconstruction
-                "regularization": reg_loss.item(),  # Smoothness + Path
-            }
-        )
+        # Store loss history
+        loss_history.append({
+            'total': loss_dict['total'].item(),
+            'mle': loss_dict['mle'].item(),
+            'consistency': loss_dict['consistency'].item(),
+            'path': loss_dict['path'].item(),
+        })
 
         if verbose and isinstance(pbar, type(trange(0))):
-            current_lr = optimizer.param_groups[0]["lr"]
-            pbar.set_description(
-                f"ATR Loss: {total_loss.item():.4f} (Primary: {primary_loss.item():.4f}, Reg: {reg_loss.item():.4f}) LR: {current_lr:.2e}"
-            )
+            current_lr = optimizer.param_groups[0]['lr']
+            # Adaptive description based on loss components
+            if loss_dict['consistency'].item() > 0:
+                desc = f"Loss: {loss_dict['total'].item():.4f} (MLE: {loss_dict['mle'].item():.4f}, Cons: {loss_dict['consistency'].item():.4f}, Path: {loss_dict['path'].item():.4f}) LR: {current_lr:.2e}"
+            else:
+                desc = f"Loss: {loss_dict['total'].item():.4f} (MLE: {loss_dict['mle'].item():.4f}, Path: {loss_dict['path'].item():.4f}) LR: {current_lr:.2e}"
+            pbar.set_description(desc)
 
     bridge.eval()
     return loss_history
 
 
-def train_glow_bridge_lcl(
-    bridge: NeuralBridgeExpressive,
-    marginal_data: Dict[float, torch.Tensor],
-    epochs: int = 2000,
-    lr: float = 5e-4,
-    lambda_lcl: float = 1.0,
-    lambda_path: float = 0.01,
-    n_trajectories: int = 512,  # Number of paired trajectories
-    weight_decay: float = 1e-4,
-    use_scheduler: bool = True,
-    grad_clip_norm: float = 1.0,
-    verbose: bool = True,
-) -> list:
-    """
-    Train the GLOW-based bridge using the Latent Consistency Loss (LCL) objective.
-    Uses modularized loss functions for clarity and maintainability.
-    """
-    from tqdm import trange
-
-    # Initialize modular losses
-    losses = BridgeLosses(bridge)
-    
-    # Create paired trajectory data with fixed indexing
-    paired_data = create_paired_trajectories(marginal_data, n_trajectories)
-
-    # Use AdamW for decoupled weight decay
-    optimizer = torch.optim.AdamW(bridge.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # Initialize Scheduler
-    scheduler = None
-    if use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    loss_history = []
-
-    if verbose:
-        pbar = trange(epochs)
-    else:
-        pbar = range(epochs)
-
-    bridge.train()  # Ensure model is in training mode
-
-    for epoch in pbar:
-        optimizer.zero_grad()
-
-        # Compute LCL loss using modular function
-        total_loss, primary_loss, reg_loss = losses.lcl_loss(
-            paired_data=paired_data,
-            lambda_lcl=lambda_lcl,
-            lambda_path=lambda_path,
-        )
-
-        total_loss.backward()
-
-        # Apply gradient clipping
-        if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(bridge.parameters(), max_norm=grad_clip_norm)
-
-        optimizer.step()
-
-        # Update learning rate
-        if scheduler:
-            scheduler.step()
-
-        loss_history.append(
-            {
-                "total": total_loss.item(),
-                "primary": primary_loss.item(),  # MLE + LCL
-                "regularization": reg_loss.item(),  # Path regularization
-            }
-        )
-
-        if verbose and isinstance(pbar, type(trange(0))):
-            current_lr = optimizer.param_groups[0]["lr"]
-            pbar.set_description(
-                f"LCL Loss: {total_loss.item():.4f} (Primary: {primary_loss.item():.4f}, Reg: {reg_loss.item():.4f}) LR: {current_lr:.2e}"
-            )
-
-    bridge.eval()
-    return loss_history
 
 
 def create_paired_trajectories(
@@ -670,7 +522,7 @@ def setup_experiment(args) -> Dict:
     # Flat configuration - no nested dicts for easy parameter access
     config = {
         # Core experiment settings
-        "device": "cpu",
+        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         "data_type": args.data_type,
         "output_dir": args.output_dir if getattr(args, 'output_dir', None) else f"output_glow_flow_{args.data_type}",
         
@@ -832,12 +684,17 @@ def train_model(bridge, marginal_data, config):
         "Note: GLOW models typically require more epochs (2000+) for optimal convergence"
     )
 
+    # Configure loss composition
+    loss_config = {
+        'lambda_path': config['lambda_path'],
+    }
+
     loss_history = train_glow_bridge(
         bridge=bridge,
         marginal_data=marginal_data,
+        loss_config=loss_config,
         epochs=config["epochs"],
         lr=config["lr"],
-        lambda_path=config["lambda_path"],
         weight_decay=config["weight_decay"],
         use_scheduler=config["use_scheduler"],
         grad_clip_norm=config["grad_clip_norm"],
@@ -854,6 +711,8 @@ def validate_model(bridge, marginal_data, config):
     """Validate the trained model."""
 
     print("\n--- Validation ---")
+    
+    validation_metrics = {}  # Initialize to avoid undefined variable error
 
     if config["data_type"] == "grf":
         # Generate samples for validation using proper comparative backward sampling
@@ -1024,14 +883,12 @@ def main():
         help="Number of training epochs (recommend 2000+ for GLOW)",
     )
     parser.add_argument(
-        "--atr",
-        action="store_true",
-        help="Use Anchored Trajectory Reconstruction (ATR) training",
-    )
-    parser.add_argument(
         "--lcl",
         action="store_true",
         help="Use Latent Consistency Loss (LCL) training (recommended)",
+    )
+    parser.add_argument(
+        "--initloss", action="store_true", help="Use initial latent consistency loss (for stability)"
     )
     parser.add_argument(
         "--lr",
@@ -1043,13 +900,10 @@ def main():
         "--lambda_recon", type=float, default=1.0, help="ATR reconstruction loss weight"
     )
     parser.add_argument(
-        "--lambda_smooth",
-        type=float,
-        default=0.001,
-        help="ATR smoothness regularization weight",
-    )
-    parser.add_argument(
-        "--lambda_lcl", type=float, default=1.0, help="LCL latent consistency weight"
+        "--lambda_lcl", 
+        type=float, 
+        default=1.0, 
+        help="Consistency weight for trajectory-based training (applies to both --lcl and --initloss modes)"
     )
     parser.add_argument(
         "--n_trajectories",
@@ -1155,92 +1009,81 @@ def main():
         bridge = create_model(config, data_dim, data_mean, data_std)
 
         # 4. Train model
-        if args.lcl:
-            print(
-                f"\n--- LCL Training (λ_lcl={args.lambda_lcl}, λ_path={config['lambda_path']}) ---"
-            )
-            print(
-                "Using Latent Consistency Loss objective for robust trajectory consistency"
-            )
-            print("LCL enforces that physical trajectories correspond to single latent variables")
-            train_glow_bridge_lcl(
-                bridge=bridge,
-                marginal_data=marginal_data,
-                epochs=config["epochs"],
-                lr=config["lr"],
-                lambda_lcl=args.lambda_lcl,
-                lambda_path=config["lambda_path"],
-                n_trajectories=args.n_trajectories,
-                weight_decay=config["weight_decay"],
-                use_scheduler=config["use_scheduler"],
-                grad_clip_norm=config["grad_clip_norm"],
-                verbose=True,
-            )
-        elif args.atr:
-            print(
-                f"\n--- ATR Training (λ_recon={args.lambda_recon}, λ_smooth={args.lambda_smooth}) ---"
-            )
-            print(
-                "Using Anchored Trajectory Reconstruction objective for trajectory consistency"
-            )
-            print("WARNING: ATR training uses the corrected data pairing but may still be unstable")
-            train_glow_bridge_atr(
-                bridge=bridge,
-                marginal_data=marginal_data,
-                epochs=config["epochs"],
-                lr=config["lr"],
-                lambda_recon=args.lambda_recon,
-                lambda_smooth=args.lambda_smooth,
-                lambda_path=0.0,  # Disable kinetic energy in favor of smoothness
-                n_trajectories=args.n_trajectories,
-                weight_decay=config["weight_decay"],
-                use_scheduler=config["use_scheduler"],
-                grad_clip_norm=config["grad_clip_norm"],
-                verbose=True,
-            )
-        else:
-            # Optionally skip training if a model already exists for this experiment
-            skip_training = False
-            if getattr(args, 'experiment_name', None) and not getattr(args, 'force_retrain', False):
-                candidate_load = Path(config['output_dir']) / f"model_{args.experiment_name}.pt"
-                if candidate_load.exists():
-                    try:
-                        print(f"Found existing model for experiment '{args.experiment_name}': {candidate_load}. Loading and skipping training.")
-                        bridge.load_state_dict(torch.load(candidate_load, map_location=config['device']))
-                        skip_training = True
-                    except Exception as e:
-                        print(f"Warning: failed to load existing model {candidate_load}: {e}. Proceeding to train.")
+        # Optionally skip training if a model already exists for this experiment
+        skip_training = False
+        if getattr(args, 'experiment_name', None) and not getattr(args, 'force_retrain', False):
+            candidate_load = Path(config['output_dir']) / f"model_{args.experiment_name}.pt"
+            if candidate_load.exists():
+                try:
+                    print(f"Found existing model for experiment '{args.experiment_name}': {candidate_load}. Loading and skipping training.")
+                    bridge.load_state_dict(torch.load(candidate_load, map_location=config['device']))
+                    skip_training = True
+                except Exception as e:
+                    print(f"Warning: failed to load existing model {candidate_load}: {e}. Proceeding to train.")
 
-            if not skip_training:
-                print("\n--- Standard Training ---")
+        if not skip_training:
+            # Determine training mode and prepare data
+            if args.lcl or args.initloss:
+                mode = 'mean' if args.lcl else 'initial'
+                print(
+                    f"\n--- Trajectory-Based Training ({'LCL' if args.lcl else 'Initial Condition'}, λ={args.lambda_lcl}, λ_path={config['lambda_path']}) ---"
+                )
+                print(
+                    f"Using {'Latent Consistency Loss' if args.lcl else 'Initial Condition Loss'} for trajectory consistency"
+                )
+                paired_data = create_paired_trajectories(marginal_data, args.n_trajectories)
+                
+                # Configure loss with trajectory consistency
+                # NOTE: lambda_lcl serves as the consistency weight for both LCL (mean) and 
+                # initial condition modes. This follows KISS - one weight parameter suffices
+                # since both objectives enforce the same conceptual goal (latent consistency)
+                loss_config = {
+                    'lambda_path': config['lambda_path'],
+                    'lambda_consistency': args.lambda_lcl,
+                    'consistency_mode': mode,
+                }
+                
+                loss_history = train_glow_bridge(
+                    bridge=bridge,
+                    paired_data=paired_data,
+                    loss_config=loss_config,
+                    epochs=config["epochs"],
+                    lr=config["lr"],
+                    weight_decay=config["weight_decay"],
+                    use_scheduler=config["use_scheduler"],
+                    grad_clip_norm=config["grad_clip_norm"],
+                    verbose=True,
+                )
+            else:
+                print("\n--- Standard MLE Training ---")
                 loss_history = train_model(bridge, marginal_data, config)
 
-                # Save trained model state (KISS: save state_dict only)
-                try:
-                    exp_name = args.experiment_name if getattr(args, 'experiment_name', None) else None
-                    model_path = Path(config['output_dir']) / (f"model_{exp_name}.pt" if exp_name else "model.pt")
-                    torch.save(bridge.state_dict(), model_path)
-                    # Also write a convenience copy at output_dir/model.pt
-                    default_model = Path(config['output_dir']) / "model.pt"
-                    if model_path.name != default_model.name:
-                        torch.save(bridge.state_dict(), default_model)
-                    print(f"Saved trained model to {model_path}")
+            # Save trained model state (KISS: save state_dict only)
+            try:
+                exp_name = args.experiment_name if getattr(args, 'experiment_name', None) else None
+                model_path = Path(config['output_dir']) / (f"model_{exp_name}.pt" if exp_name else "model.pt")
+                torch.save(bridge.state_dict(), model_path)
+                # Also write a convenience copy at output_dir/model.pt
+                default_model = Path(config['output_dir']) / "model.pt"
+                if model_path.name != default_model.name:
+                    torch.save(bridge.state_dict(), default_model)
+                print(f"Saved trained model to {model_path}")
 
-                    # Save lightweight model metadata (training summary)
-                    try:
-                        model_meta = {
-                            'experiment_name': exp_name,
-                            'epochs': config.get('epochs'),
-                            'final_loss': loss_history[-1]['total'] if loss_history and isinstance(loss_history, list) and 'total' in loss_history[-1] else None,
-                            'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                        }
-                        with open(Path(config['output_dir']) / 'model_metadata.json', 'w') as mmf:
-                            json.dump(model_meta, mmf, indent=2)
-                        print(f"Saved model metadata to {Path(config['output_dir']) / 'model_metadata.json'}")
-                    except Exception as e:
-                        print(f"Warning: failed to save model metadata: {e}")
+                # Save lightweight model metadata (training summary)
+                try:
+                    model_meta = {
+                        'experiment_name': exp_name,
+                        'epochs': config.get('epochs'),
+                        'final_loss': loss_history[-1]['total'] if loss_history and isinstance(loss_history, list) and 'total' in loss_history[-1] else None,
+                        'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                    with open(Path(config['output_dir']) / 'model_metadata.json', 'w') as mmf:
+                        json.dump(model_meta, mmf, indent=2)
+                    print(f"Saved model metadata to {Path(config['output_dir']) / 'model_metadata.json'}")
                 except Exception as e:
-                    print(f"Warning: failed to save trained model: {e}")
+                    print(f"Warning: failed to save model metadata: {e}")
+            except Exception as e:
+                print(f"Warning: failed to save trained model: {e}")
         # 5. Validate model
         validate_model(bridge, marginal_data, config)
 
@@ -1251,11 +1094,11 @@ def main():
         print("✓ TRAINING COMPLETED SUCCESSFULLY")
         print(f"Results saved to: {config['output_dir']}")
         if args.lcl:
-            print("✓ LCL training enforces trajectory consistency via latent variance minimization")
-        elif args.atr:
-            print("⚠ ATR training completed - consider LCL for more robust trajectory learning") 
+            print("✓ LCL training enforces trajectory consistency via mean latent")
+        elif args.initloss:
+            print("✓ Initial condition training enforces consistent initial latent")
         else:
-            print("Note: Standard training matches marginals only - use --lcl for trajectory consistency")
+            print("Note: Standard MLE training - use --lcl or --initloss for trajectory consistency")
         print("=" * 80)
 
     except Exception as e:
