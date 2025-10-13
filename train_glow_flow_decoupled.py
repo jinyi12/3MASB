@@ -430,6 +430,33 @@ class DecoupledBridge(nn.Module):
         drift = velocity - (self.sigma_reverse**2 / 2) * score
         
         return drift
+    
+    # ========================================================================
+    # Compatibility Methods for Visualization
+    # ========================================================================
+    
+    @property
+    def base_dist(self):
+        """Base distribution compatibility for visualization."""
+        return self.density_model.base_dist
+    
+    @property
+    def flow(self):
+        """Flow compatibility for visualization - return dynamics model."""
+        return self.dynamics_model
+    
+    def get_params(self, t: Tensor):
+        """Get distribution parameters for visualization compatibility.
+        For decoupled bridge, we return simple Gaussian parameters.
+        """
+        batch_size = t.shape[0] if t.dim() > 0 else 1
+        device = t.device if torch.is_tensor(t) else self.data_mean.device
+        
+        # Return simple Gaussian parameters centered at data mean
+        mu = self.data_mean.unsqueeze(0).expand(batch_size, -1).to(device)
+        gamma = torch.ones_like(mu)  # Unit variance
+        
+        return mu, gamma
 
 
 # ============================================================================
@@ -524,6 +551,7 @@ def train_dynamics_model(
     lambda_path: float = 0.01, # FIX: Added path regularization weight
     use_scheduler: bool = True,
     grad_clip_norm: float = 1.0,
+    batch_size: int = 128,  # Batch size for memory management
     verbose: bool = True,
 ) -> list:
     """
@@ -560,73 +588,104 @@ def train_dynamics_model(
     # Get initial data
     x_0 = marginal_data[0.0]
     times = sorted([t for t in marginal_data.keys() if t > 0])
+    n_samples = x_0.shape[0]
+    n_batches = (n_samples + batch_size - 1) // batch_size
     
     for epoch in pbar:
-        optimizer.zero_grad()
+        epoch_loss = 0.0
+        epoch_regression = 0.0
+        epoch_path_reg = 0.0
         
-        total_loss = 0.0
-        regression_loss = 0.0
-        path_reg_loss = 0.0
-        
-        # --- Supervised Regression Loss (L_map) and Path Regularization (L_path) ---
-        for t_val in times:
-            x_target = marginal_data[t_val]
-            t_tensor = torch.tensor([t_val], device=x_0.device, dtype=x_0.dtype)
+        # Process in batches with gradient accumulation
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_samples)
+            
+            optimizer.zero_grad()
+            
+            total_loss = 0.0
+            regression_loss = 0.0
+            path_reg_loss = 0.0
+            
+            # Get batch data
+            x_0_batch = x_0[start_idx:end_idx]
+            
+            # --- Supervised Regression Loss (L_map) and Path Regularization (L_path) ---
+            for t_val in times:
+                x_target_batch = marginal_data[t_val][start_idx:end_idx]
+                t_tensor = torch.tensor([t_val], device=x_0_batch.device, dtype=x_0_batch.dtype)
+                
+                if lambda_path > 0:
+                    # Calculate T(x0, t) and dT/dt simultaneously using t_dir (JVP).
+                    
+                    # Define T(t) for fixed x_0
+                    def transport_fixed_x0(time_tensor):
+                        return bridge.transport(x_0_batch, time_tensor)
+
+                    # Format time tensor correctly for the bridge helper
+                    formatted_t = bridge._format_time(t_tensor, x_0_batch.shape[0])
+
+                    # Compute prediction and velocity
+                    # t_dir returns (f(t), f'(t))
+                    x_pred, velocity = t_dir(transport_fixed_x0, formatted_t, create_graph=True)
+
+                    # Path regularization loss (Kinetic energy)
+                    path_loss_t = 0.5 * torch.mean(velocity**2)
+                    path_reg_loss += path_loss_t
+                    
+                else:
+                     # Standard MSE only
+                    x_pred = bridge.transport(x_0_batch, t_tensor)
+                
+                # MSE loss
+                loss_t = torch.mean((x_pred - x_target_batch) ** 2)
+                regression_loss += loss_t
+            
+            # Average over time points
+            regression_loss = regression_loss / len(times)
+            total_loss += regression_loss
             
             if lambda_path > 0:
-                # Calculate T(x0, t) and dT/dt simultaneously using t_dir (JVP).
-                
-                # Define T(t) for fixed x_0
-                def transport_fixed_x0(time_tensor):
-                    return bridge.transport(x_0, time_tensor)
+                path_reg_loss = path_reg_loss / len(times)
+                total_loss += lambda_path * path_reg_loss
 
-                # Format time tensor correctly for the bridge helper
-                formatted_t = bridge._format_time(t_tensor, x_0.shape[0])
-
-                # Compute prediction and velocity
-                # t_dir returns (f(t), f'(t))
-                x_pred, velocity = t_dir(transport_fixed_x0, formatted_t, create_graph=True)
-
-                # Path regularization loss (Kinetic energy)
-                path_loss_t = 0.5 * torch.mean(velocity**2)
-                path_reg_loss += path_loss_t
-                
-            else:
-                 # Standard MSE only
-                x_pred = bridge.transport(x_0, t_tensor)
+            # --- Training Step ---
+            total_loss.backward()
             
-            # MSE loss
-            loss_t = torch.mean((x_pred - x_target) ** 2)
-            regression_loss += loss_t
+            # Gradient clipping
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(bridge.dynamics_model.parameters(), grad_clip_norm)
+            
+            optimizer.step()
+            
+            # Accumulate losses
+            epoch_loss += total_loss.item()
+            epoch_regression += regression_loss.item()
+            if lambda_path > 0:
+                epoch_path_reg += path_reg_loss.item()
+            
+            # Memory cleanup
+            del x_pred, total_loss, regression_loss
+            if lambda_path > 0:
+                del velocity, path_loss_t, path_reg_loss
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        # Average over time points
-        regression_loss = regression_loss / len(times)
-        total_loss += regression_loss
-        
-        if lambda_path > 0:
-            path_reg_loss = path_reg_loss / len(times)
-            total_loss += lambda_path * path_reg_loss
-
-        # --- Training Step ---
-        total_loss.backward()
-        
-        # Gradient clipping
-        if grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(bridge.dynamics_model.parameters(), grad_clip_norm)
-        
-        optimizer.step()
+        # Average over batches
+        epoch_loss /= n_batches
+        epoch_regression /= n_batches
+        epoch_path_reg /= n_batches
         
         if scheduler:
             scheduler.step()
         
-        loss_history.append(total_loss.item())
+        loss_history.append(epoch_loss)
         
         if verbose and isinstance(pbar, type(trange(0))):
             # Update postfix with detailed loss components
             pbar.set_postfix({
-                "Map": f"{regression_loss.item():.4f}",
-                "Path": f"{path_reg_loss.item() if lambda_path > 0 else 0:.4f}",
-                "Total": f"{total_loss.item():.4f}"
+                "Map": f"{epoch_regression:.4f}",
+                "Path": f"{epoch_path_reg:.4f}" if lambda_path > 0 else "0.0000",
+                "Total": f"{epoch_loss:.4f}"
             })
     
     bridge.dynamics_model.eval()
@@ -644,6 +703,7 @@ def train_decoupled_bridge(
     weight_decay: float = 1e-4,
     use_scheduler: bool = True,
     grad_clip_norm: float = 1.0,
+    training_batch_size: int = 128,  # Batch size for dynamics training
     verbose: bool = True,
 ) -> Dict[str, list]:
     """
@@ -699,6 +759,7 @@ def train_decoupled_bridge(
         lambda_path=0,  # Path regularization weight
         use_scheduler=use_scheduler,
         grad_clip_norm=grad_clip_norm,
+        batch_size=training_batch_size,
         verbose=verbose,
     )
     
@@ -776,12 +837,22 @@ def setup_experiment(args) -> Dict:
         "n_viz_particles": getattr(args, 'n_viz_particles', 256),
         "n_validation_trajectories": getattr(args, 'n_validation_trajectories', 512),
         "validation_batch_size": getattr(args, 'validation_batch_size', None),
+        "training_batch_size": getattr(args, 'training_batch_size', 64),  # Conservative for 64x64 resolution
     }
     
     # Compute derived parameters
     config["data_dim"] = config["resolution"] ** 2 if config["data_type"] == "grf" else 64
     if config["validation_batch_size"] is None:
         config["validation_batch_size"] = min(128, config["n_validation_trajectories"])
+    
+    # Scale training batch size based on resolution (memory usage scales with resolution^2)
+    if config["training_batch_size"] is None or config["training_batch_size"] == 64:
+        if config["resolution"] >= 64:
+            config["training_batch_size"] = 32  # Very conservative for 64x64
+        elif config["resolution"] >= 32:
+            config["training_batch_size"] = 64
+        else:
+            config["training_batch_size"] = 128
     
     return config
 
@@ -876,6 +947,7 @@ def train_model(bridge, marginal_data, config):
         weight_decay=config["weight_decay"],
         use_scheduler=config["use_scheduler"],
         grad_clip_norm=config["grad_clip_norm"],
+        training_batch_size=config["training_batch_size"],
         verbose=True,
     )
     
@@ -929,7 +1001,7 @@ def validate_model(bridge, marginal_data, config):
                 # Store samples at constraint times
                 for t_constraint in times:
                     if abs(t_current - t_constraint) < abs(dt) / 2:
-                        backward_accumulator[t_constraint].append(z.clone())
+                        backward_accumulator[t_constraint].append(z.clone().cpu())  # Move to CPU
 
                 if step < config["n_sde_steps"]:
                     # Reverse SDE step
@@ -938,12 +1010,17 @@ def validate_model(bridge, marginal_data, config):
                     noise = torch.randn_like(z)
                     diffusion = bridge.sigma_reverse * noise * sqrt_dt
                     z = z + drift * dt + diffusion
+                    
+                    # Memory cleanup every 10 steps
+                    if step % 10 == 0:
+                        del drift, noise, diffusion
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         backward_samples = {}
         feature_shape = x_T.shape[1:]
         for t_val, chunks in backward_accumulator.items():
             if chunks:
-                backward_samples[t_val] = torch.cat(chunks, dim=0)
+                backward_samples[t_val] = torch.cat(chunks, dim=0).to(x_T.device)
             else:
                 backward_samples[t_val] = torch.empty(
                     0, *feature_shape, device=x_T.device, dtype=x_T.dtype
@@ -972,14 +1049,26 @@ def validate_model(bridge, marginal_data, config):
             w2 = validation_metrics.get("w2_distances", [None])[times.index(t_val)]
             if w2 is not None:
                 print(f"  t={t_val:.2f}: W2 distance = {w2:.6f}")
+        
+        # Return both metrics and samples for reuse in visualization
+        return validation_metrics, backward_samples
     
-    return validation_metrics if config["data_type"] == "grf" else None
+    # For non-GRF data, return None for both
+    return None, None
 
 
-def visualize_results(bridge, marginal_data, config):
-    """Generate visualizations of the results."""
+def visualize_results(bridge, marginal_data, config, validation_samples=None):
+    """Generate visualizations of the results.
+    
+    Args:
+        validation_samples: Optional dict of pre-generated backward samples from validation.
+                          If provided, these will be reused for statistical visualizations,
+                          avoiding duplicate SDE integration.
+    """
     
     print("\n--- Visualization ---")
+    if validation_samples is not None:
+        print("Reusing validation samples for visualization (saves ~50% computation)")
     print(f"Generating visualizations in '{config['output_dir']}'...")
     
     try:
@@ -988,9 +1077,11 @@ def visualize_results(bridge, marginal_data, config):
             marginal_data=marginal_data,
             T=config["T"],
             output_dir=config["output_dir"],
+            is_grf=(config["data_type"] == "grf"),  # Pass is_grf parameter
             n_viz_particles=config["n_viz_particles"],
             n_sde_steps=config["n_sde_steps"],
             enable_covariance_analysis=config["enable_covariance_analysis"],
+            validation_samples=validation_samples,  # Pass samples for reuse
         )
         print("✓ Visualizations generated successfully")
     except Exception as e:
@@ -1024,6 +1115,10 @@ def main():
     parser.add_argument("--micro_corr_length", type=float, help="GRF correlation length")
     parser.add_argument("--covariance_type", type=str, help="GRF kernel type")
     parser.add_argument("--resolution", type=int, help="Spatial resolution")
+    parser.add_argument("--l_domain", type=float, help="GRF domain size")
+    parser.add_argument("--h_max_factor", type=float, help="GRF maximum factor")
+    parser.add_argument("--mean_val", type=float, help="GRF mean value")
+    parser.add_argument("--std_val", type=float, help="GRF standard deviation")
     parser.add_argument("--hidden_size", type=int, help="Model hidden size")
     parser.add_argument("--n_blocks_flow", type=int, help="Number of GLOW blocks")
     parser.add_argument("--weight_decay", type=float, help="Weight decay")
@@ -1039,6 +1134,7 @@ def main():
     parser.add_argument("--n_viz_particles", type=int, help="Number of visualization particles")
     parser.add_argument("--n_sde_steps", type=int, help="SDE integration steps")
     parser.add_argument("--validation_batch_size", type=int, help="Reverse SDE validation batch size (controls memory usage)")
+    parser.add_argument("--training_batch_size", type=int, help="Training batch size for dynamics model (controls memory usage)")
     
     args = parser.parse_args()
     
@@ -1082,11 +1178,11 @@ def main():
             json.dump(history, f, indent=2)
         print(f"\nTraining history saved to {history_file}")
         
-        # Validate model
-        validate_model(bridge, normalized_data, config)
+        # Validate model (returns metrics and samples)
+        validation_metrics, validation_samples = validate_model(bridge, normalized_data, config)
         
-        # Visualize results
-        visualize_results(bridge, normalized_data, config)
+        # Visualize results (reuse validation samples to avoid duplicate computation)
+        visualize_results(bridge, normalized_data, config, validation_samples=validation_samples)
         
         print("\n" + "=" * 80)
         print("✓ Decoupled training completed successfully!")
