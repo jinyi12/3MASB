@@ -22,22 +22,42 @@ from scipy.stats import gaussian_kde
 from typing import Dict, Tuple
 
 from .simulation import solve_gaussian_bridge_reverse_sde, solve_backward_sde_euler_maruyama, generate_backward_samples
-from .validation import compute_sample_covariance_matrix
 # Correlation functions are defined inline below
 
 # Add correlation computation functions
-def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
+def compute_sample_correlation_matrix(samples: Tensor, truncate: bool = True, variance_threshold: float = 0.999) -> Tensor:
     """
-    Computes the full DxD sample correlation matrix for a batch of samples.
+    Computes the DxD sample correlation matrix for a batch of samples.
     Args:
         samples: Tensor of shape [N, D] (N samples, D dimensions).
+        truncate: Whether to truncate to retain specified variance fraction.
+        variance_threshold: Fraction of variance to retain if truncating.
     Returns:
-        Correlation matrix of shape [D, D].
+        Correlation matrix of shape [D, D] (possibly truncated).
     """
+    corr_matrix, _ = compute_sample_correlation_matrix_with_eigen(samples, truncate, variance_threshold)
+    return corr_matrix
+
+
+def compute_sample_correlation_matrix_with_eigen(samples: Tensor, truncate: bool = True, variance_threshold: float = 0.999) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Computes the DxD sample correlation matrix for a batch of samples,
+    returning both the matrix and eigendecomposition information.
+    
+    Args:
+        samples: Tensor of shape [N, D] (N samples, D dimensions).
+        truncate: Whether to truncate to retain specified variance fraction.
+        variance_threshold: Fraction of variance to retain if truncating.
+    Returns:
+        Tuple of (correlation_matrix, eigen_info) where eigen_info contains eigendecomposition data.
+    """
+    # Import truncation function from validation module
+    from .validation import truncate_correlation_matrix
+    
     N, D = samples.shape
     if N <= 1:
         print(f"Warning: Insufficient samples (N={N}) to compute correlation. Returning identity matrix.")
-        return torch.eye(D, device=samples.device)
+        return torch.eye(D, device=samples.device), {}
     try:
         # Compute covariance matrix first
         cov_matrix = torch.cov(samples.T)
@@ -50,10 +70,27 @@ def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
         correlation_matrix = cov_matrix * inv_std.unsqueeze(0) * inv_std.unsqueeze(1)
         # Clamp to valid correlation range
         correlation_matrix = torch.clamp(correlation_matrix, min=-1.0, max=1.0)
+        
+        if truncate:
+            correlation_matrix, eigen_info = truncate_correlation_matrix(correlation_matrix, variance_threshold)
+        else:
+            # Still compute eigendecomposition for non-truncated case
+            eigenvals, eigenvecs = torch.linalg.eigh(correlation_matrix)
+            sorted_indices = torch.argsort(eigenvals, descending=True)
+            eigenvals = eigenvals[sorted_indices]
+            eigenvecs = eigenvecs[:, sorted_indices]
+            cumsum_variance = torch.cumsum(eigenvals, dim=0)
+            variance_ratio = cumsum_variance / torch.sum(eigenvals)
+            eigen_info = {
+                'eigenvalues': eigenvals,
+                'eigenvectors': eigenvecs,
+                'n_components': len(eigenvals),
+                'variance_ratio': variance_ratio
+            }
     except Exception as e:
         print(f"Warning: Correlation matrix computation failed: {e}")
-        return torch.eye(D, device=samples.device)
-    return correlation_matrix
+        return torch.eye(D, device=samples.device), {}
+    return correlation_matrix, eigen_info
 
 
 def relative_correlation_frobenius_distance(corr_target: Tensor, corr_gen: Tensor) -> float:
@@ -269,87 +306,6 @@ def _plot_grf_marginals(marginal_data, output_dir, title="GRF Data Marginals"):
     filename = title.lower().replace(" ", "_") + ".png"
     plt.savefig(os.path.join(output_dir, filename), dpi=300)
     plt.close()
-
-
-def _visualize_comparative_backward_samples(
-    marginal_data: Dict[float, Tensor], 
-    ground_truth_backward: Dict[float, Tensor], 
-    learned_backward: Dict[float, Tensor], 
-    output_dir: str
-):
-    """
-    Visualize comparison between original data and backward samples starting from ground truth.
-    Shows how well the learned reverse dynamics reproduce the ground truth evolution.
-    Uses consistent sample selection to track the same samples across time points.
-    """
-    print("  - Plotting comparative backward samples (original vs ground truth backward)...")
-    
-    sorted_times = sorted(marginal_data.keys())
-    n_time_points = len(sorted_times)
-    n_samples_show = 4
-    
-    if not sorted_times:
-        return
-    data_dim = marginal_data[sorted_times[0]].shape[1]
-    resolution = int(math.sqrt(data_dim))
-    
-    if resolution * resolution != data_dim:
-        print(f"    Warning: Data dimension {data_dim} is not a perfect square. Skipping visualization.")
-        return
-
-    # Select consistent sample indices from the final time point
-    final_time = max(sorted_times)
-    n_available_samples = min(marginal_data[final_time].shape[0], ground_truth_backward[final_time].shape[0])
-    n_samples_show = min(n_samples_show, n_available_samples)
-    
-    # Use consistent indices across all time points
-    selected_indices = torch.randperm(n_available_samples)[:n_samples_show]
-
-    fig, axes = plt.subplots(2 * n_samples_show, n_time_points, 
-                           figsize=(3 * n_time_points, 3 * 2 * n_samples_show))
-    fig.suptitle("Backward Samples: Original → GT-Backward (Consistent Samples)", fontsize=16)
-    
-    if axes.ndim == 1:
-        axes = axes.reshape(-1, 1) if n_time_points == 1 else axes.reshape(1, -1)
-    
-    # Get global min/max for consistent color scaling
-    all_original = torch.cat([marginal_data[t] for t in sorted_times], dim=0).cpu().numpy()
-    all_gt_backward = torch.cat([ground_truth_backward[t] for t in sorted_times], dim=0).cpu().numpy()
-    vmin = min(all_original.min(), all_gt_backward.min())
-    vmax = max(all_original.max(), all_gt_backward.max())
-    
-    for j, t_val in enumerate(sorted_times):
-        original_data = marginal_data[t_val].cpu().numpy()
-        gt_backward_data = ground_truth_backward[t_val].cpu().numpy()
-        
-        for i in range(n_samples_show):
-            # Use consistent sample indices
-            sample_idx = selected_indices[i].item()
-            
-            # Original data (row 0, 2, 4, ...)
-            row_orig = 2 * i
-            if sample_idx < original_data.shape[0]:
-                field_orig = original_data[sample_idx].reshape(resolution, resolution)
-                axes[row_orig, j].imshow(field_orig, vmin=vmin, vmax=vmax, cmap='viridis')
-            axes[row_orig, j].axis('off')
-            if j == 0:
-                axes[row_orig, j].set_ylabel(f'Original {i+1}', rotation=90, labelpad=15)
-            if i == 0:
-                axes[row_orig, j].set_title(f't = {t_val:.2f}')
-            
-            # Ground truth backward (row 1, 3, 5, ...)
-            row_gt = 2 * i + 1
-            if sample_idx < gt_backward_data.shape[0]:
-                field_gt = gt_backward_data[sample_idx].reshape(resolution, resolution)
-                axes[row_gt, j].imshow(field_gt, vmin=vmin, vmax=vmax, cmap='viridis')
-            axes[row_gt, j].axis('off')
-            if j == 0:
-                axes[row_gt, j].set_ylabel(f'GT-Backward {i+1}', rotation=90, labelpad=15)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "comparative_backward_samples.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
 
 def _visualize_ground_truth_samples(marginal_data: Dict[float, Tensor], output_dir: str, sample_indices: Tensor = None):
     """
@@ -649,8 +605,9 @@ def _visualize_variance_fields_comparison(
         samples_data = marginal_data[t_val].cpu()
         samples_gen = generated_samples[t_val].cpu()
         
-        corr_data = compute_sample_correlation_matrix(samples_data)
-        corr_gen = compute_sample_correlation_matrix(samples_gen)
+        print(f"    Computing truncated correlation matrices for t={t_val:.2f} (99.9% variance)...")
+        corr_data = compute_sample_correlation_matrix(samples_data, truncate=True, variance_threshold=0.999)
+        corr_gen = compute_sample_correlation_matrix(samples_gen, truncate=True, variance_threshold=0.999)
         corr_data_list.append(corr_data)
         corr_gen_list.append(corr_gen)
 
@@ -661,7 +618,7 @@ def _visualize_variance_fields_comparison(
     fig_var, axes_var = plt.subplots(2, n_time_points, figsize=(10, 6), sharex=True, sharey=True)
     if n_time_points == 1:
         axes_var = axes_var.reshape(2, 1)
-    fig_var.suptitle("Correlation Field Comparison (Diagonal Elements)", fontsize=12)
+    fig_var.suptitle("Truncated Correlation Field Comparison (99.9% Variance)", fontsize=12)
 
     # Note: Correlation diagonal elements are always 1.0 by definition
     # We'll visualize the off-diagonal mean correlation instead
@@ -715,9 +672,13 @@ def _visualize_eigenvalue_spectra_comparison(
     generated_samples: Dict[float, Tensor], 
     output_dir: str
 ):
-    """Visualizes eigenvalue spectra comparison of covariance matrices between original and generated samples."""
+    """
+    Visualizes full eigenvalue spectra comparison showing the complete spectrum 
+    with truncation threshold indicated. Avoids redundant eigendecomposition by 
+    reusing results from correlation matrix computation.
+    """
     format_for_paper()
-    print("  - Plotting covariance eigenvalue spectra comparison...")
+    print("  - Plotting full correlation eigenvalue spectra comparison...")
     
     sorted_times = sorted(marginal_data.keys())
     if not sorted_times:
@@ -727,44 +688,88 @@ def _visualize_eigenvalue_spectra_comparison(
     selected_indices = np.linspace(0, len(sorted_times)-1, n_time_points, dtype=int)
     selected_times = [sorted_times[i] for i in selected_indices]
 
-    # Create eigenvalue spectra figure - reasonable paper size
-    fig_eig, axes_eig = plt.subplots(1, n_time_points, figsize=(12, 4))
+    # Create figure with two rows: eigenvalue spectrum and cumulative variance
+    fig, axes = plt.subplots(2, n_time_points, figsize=(12, 8))
     if n_time_points == 1:
-        axes_eig = [axes_eig]
-    fig_eig.suptitle("Covariance Matrix Eigenvalue Spectrum Comparison", fontsize=12)
+        axes = axes.reshape(-1, 1)
+    fig.suptitle("Full Correlation Matrix Eigenvalue Spectrum Analysis", fontsize=12)
 
     for i, t_val in enumerate(selected_times):
         samples_data = marginal_data[t_val].cpu()
         samples_gen = generated_samples[t_val].cpu()
         
-        cov_data = compute_sample_covariance_matrix(samples_data)
-        cov_gen = compute_sample_covariance_matrix(samples_gen)
+        # Compute correlation matrices WITH eigendecomposition (no redundant computation)
+        print(f"    Computing correlation eigendecomposition for t={t_val:.2f}...")
+        _, eigen_info_data = compute_sample_correlation_matrix_with_eigen(
+            samples_data, truncate=True, variance_threshold=0.999
+        )
+        _, eigen_info_gen = compute_sample_correlation_matrix_with_eigen(
+            samples_gen, truncate=True, variance_threshold=0.999
+        )
         
-        ax_eig = axes_eig[i]
-        try:
-            eigvals_data = torch.linalg.eigvalsh(cov_data.double())
-            eigvals_gen = torch.linalg.eigvalsh(cov_gen.double())
-            eigvals_data = torch.sort(eigvals_data, descending=True)[0].float()
-            eigvals_gen = torch.sort(eigvals_gen, descending=True)[0].float()
-            # For covariance matrices, eigenvalues should be non-negative
-            eigvals_data = torch.clamp(eigvals_data, min=1e-12)
-            eigvals_gen = torch.clamp(eigvals_gen, min=1e-12)
-            
-            ax_eig.loglog(eigvals_data.numpy(), 'b-', label='Target', linewidth=2)
-            ax_eig.loglog(eigvals_gen.numpy(), 'r--', label='Generated', linewidth=2)
-            ax_eig.set_title(f"t = {t_val:.2f}")
-            ax_eig.set_xlabel("Mode Index")
-            if i == 0:
-                ax_eig.set_ylabel("Covariance Eigenvalue")
-                ax_eig.legend()
-            ax_eig.grid(True, which="both", ls="--", alpha=0.3)
-        except Exception as e:
-            print(f"    Warning: Covariance eigenvalue computation failed at t={t_val:.2f}: {e}")
-            ax_eig.text(0.5, 0.5, "Covariance eigenvalue\ncomputation failed", ha='center', va='center', transform=ax_eig.transAxes)
+        if not eigen_info_data or not eigen_info_gen:
+            print(f"    Warning: Eigendecomposition failed for t={t_val:.2f}")
+            continue
+        
+        # Extract eigenvalues and variance info
+        eigvals_data = eigen_info_data['eigenvalues'].cpu().numpy()
+        eigvals_gen = eigen_info_gen['eigenvalues'].cpu().numpy()
+        n_components_data = eigen_info_data['n_components']
+        n_components_gen = eigen_info_gen['n_components']
+        variance_ratio_data = eigen_info_data['variance_ratio'].cpu().numpy()
+        variance_ratio_gen = eigen_info_gen['variance_ratio'].cpu().numpy()
+        
+        # Top row: Eigenvalue spectrum (log-log plot)
+        ax_eigen = axes[0, i]
+        
+        # Plot full spectrum
+        ax_eigen.loglog(range(1, len(eigvals_data) + 1), eigvals_data, 
+                       'b-', label='Target', linewidth=2, alpha=0.7)
+        ax_eigen.loglog(range(1, len(eigvals_gen) + 1), eigvals_gen, 
+                       'r--', label='Generated', linewidth=2, alpha=0.7)
+        
+        # Mark truncation cutoff with vertical lines
+        ax_eigen.axvline(n_components_data, color='blue', linestyle=':', 
+                        linewidth=1.5, alpha=0.5, label=f'99.9% cutoff (Target: {n_components_data})')
+        ax_eigen.axvline(n_components_gen, color='red', linestyle=':', 
+                        linewidth=1.5, alpha=0.5, label=f'99.9% cutoff (Gen: {n_components_gen})')
+        
+        ax_eigen.set_xlabel("Mode Index")
+        ax_eigen.set_ylabel("Eigenvalue")
+        ax_eigen.set_title(f"t = {t_val:.2f}")
+        ax_eigen.grid(True, which='both', alpha=0.3)
+        if i == 0:
+            ax_eigen.legend(fontsize=8, loc='best')
+        
+        # Bottom row: Cumulative variance explained
+        ax_var = axes[1, i]
+        
+        ax_var.semilogx(range(1, len(variance_ratio_data) + 1), variance_ratio_data * 100, 
+                       'b-', label='Target', linewidth=2, alpha=0.7)
+        ax_var.semilogx(range(1, len(variance_ratio_gen) + 1), variance_ratio_gen * 100, 
+                       'r--', label='Generated', linewidth=2, alpha=0.7)
+        
+        # Mark 99.9% threshold
+        ax_var.axhline(99.9, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='99.9% threshold')
+        ax_var.axvline(n_components_data, color='blue', linestyle=':', linewidth=1.5, alpha=0.5)
+        ax_var.axvline(n_components_gen, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
+        
+        ax_var.set_xlabel("Number of Components")
+        ax_var.set_ylabel("Cumulative Variance (%)")
+        ax_var.set_ylim([90, 100.5])
+        ax_var.grid(True, which='both', alpha=0.3)
+        if i == 0:
+            ax_var.legend(fontsize=8, loc='lower right')
+        
+        # Add text annotation with effective dimensions
+        ax_var.text(0.98, 0.05, f'Effective dim:\nTarget: {n_components_data}\nGen: {n_components_gen}',
+                   transform=ax_var.transAxes, fontsize=8,
+                   verticalalignment='bottom', horizontalalignment='right',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "statistical_covariance_eigen_spectrum.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig_eig)
+    plt.savefig(os.path.join(output_dir, "statistical_correlation_eigen_spectrum.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 
 def _visualize_covariance_heatmaps_comparison(
@@ -960,7 +965,7 @@ def _plot_marginal_data_fit(bridge, marginal_data, T, output_dir, device):
     plt.close()
 
 
-def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: float, output_dir: str, is_grf: bool = False, n_viz_particles: int = 50, n_sde_steps: int = 100, solver: str = 'euler', enable_covariance_analysis: bool = True):
+def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: float, output_dir: str, is_grf: bool = False, n_viz_particles: int = 50, n_sde_steps: int = 100, solver: str = 'euler', enable_covariance_analysis: bool = True, validation_samples: Dict[float, Tensor] = None):
     """
     Generate and save a comprehensive set of visualizations for the trained bridge.
     """
@@ -1003,7 +1008,8 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
                 n_steps=n_sde_steps, 
                 device=device,
                 solver=sde_solver,
-                z_final_ground_truth=final_samples_for_viz
+                z_final_ground_truth=final_samples_for_viz,
+                batch_size=64  # Small enough for safe processing
             )
             
             # Create original_data dict using the same sample indices
@@ -1032,15 +1038,23 @@ def visualize_bridge_results(bridge, marginal_data: Dict[float, Tensor], T: floa
 
             # For statistically accurate covariance comparisons, use FULL batches
             # anchored at the ground-truth final samples so t=1 covariances are identical.
-            z_final_full_gt = marginal_data_on_device[final_time].to(device)  # all available GT samples at t=final
-            generated_full = generate_backward_samples(
-                bridge, marginal_data,
-                n_samples=z_final_full_gt.shape[0],  # ignored when z_final_ground_truth is provided
-                n_steps=n_sde_steps,
-                device=device,
-                solver=sde_solver,
-                z_final_ground_truth=z_final_full_gt
-            )
+            if validation_samples is not None:
+                # Reuse validation samples (avoid duplicate SDE integration)
+                print("  - Reusing validation samples for statistical analysis (saves ~50% time)...")
+                generated_full = validation_samples
+            else:
+                # Generate new samples if not provided
+                print("  - Generating new samples for statistical analysis...")
+                z_final_full_gt = marginal_data_on_device[final_time].to(device)  # all available GT samples at t=final
+                generated_full = generate_backward_samples(
+                    bridge, marginal_data,
+                    n_samples=z_final_full_gt.shape[0],  # ignored when z_final_ground_truth is provided
+                    n_steps=n_sde_steps,
+                    device=device,
+                    solver=sde_solver,
+                    z_final_ground_truth=z_final_full_gt,
+                    batch_size=32  # Very conservative for large batches (1024 samples)
+                )
 
             # Prepare full-batch CPU, denormalized
             marginal_full_cpu = {t: bridge.denormalize(marginal_data_on_device[t].to(device)).cpu() for t in sorted(marginal_data_on_device.keys())}

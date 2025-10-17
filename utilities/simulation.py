@@ -92,38 +92,66 @@ def solve_backward_sde_euler_maruyama(
     z_start: Tensor,
     ts: float,
     tf: float,
-    n_steps: int
+    n_steps: int,
+    batch_size: int = 64  # Batch size for memory management
 ) -> Tensor:
     """
     Generic solver for the backward SDE using the Euler-Maruyama method.
+    Now includes batching to prevent OOM errors.
     """
     if ts <= tf:
         raise ValueError("Backward SDE requires ts > tf.")
     
     dt = (tf - ts) / n_steps
-    current_z = z_start.clone()
-    path = [current_z.clone()]
-    
     sigma_backward = bridge.sigma_reverse
     
-    for step in range(n_steps):
-        t_current = ts + step * dt
-        t_tensor = torch.tensor([[t_current]], device=current_z.device, dtype=torch.float32)
-        
-        # Enable gradients for this step even if we're in a no_grad context
-        with torch.enable_grad():
-            # Ensure current_z requires grad for score function computation
-            current_z = current_z.detach().requires_grad_(True)
-            
-            drift_backward = bridge.reverse_drift(current_z, t_tensor)
-        
-        # Update position (detach to break gradients for next iteration)
-        noise = torch.randn_like(current_z) * math.sqrt(abs(dt)) * sigma_backward
-        current_z = current_z.detach() + drift_backward.detach() * dt + noise
-        
-        path.append(current_z.clone())
+    n_samples = z_start.shape[0]
+    device = z_start.device
     
-    return torch.stack(path)
+    # Process in batches to avoid OOM
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    
+    # Store paths for each batch
+    batch_paths = []
+    
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_samples)
+        
+        current_z = z_start[start_idx:end_idx].clone()
+        batch_path = [current_z.clone()]
+        
+        for step in range(n_steps):
+            t_current = ts + step * dt
+            t_tensor = torch.tensor([[t_current]], device=device, dtype=torch.float32)
+            
+            # Enable gradients for this step even if we're in a no_grad context
+            with torch.enable_grad():
+                # Ensure current_z requires grad for score function computation
+                current_z = current_z.detach().requires_grad_(True)
+                
+                drift_backward = bridge.reverse_drift(current_z, t_tensor)
+            
+            # Update position (detach to break gradients for next iteration)
+            noise = torch.randn_like(current_z) * math.sqrt(abs(dt)) * sigma_backward
+            current_z = current_z.detach() + drift_backward.detach() * dt + noise
+            
+            batch_path.append(current_z.clone())
+        
+        # Stack batch path: [n_steps+1, batch_size, ...]
+        batch_paths.append(torch.stack(batch_path))
+        
+        # Memory cleanup
+        del current_z, batch_path, drift_backward, noise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Concatenate all batches along the sample dimension
+    # batch_paths: list of [n_steps+1, batch_size, ...]
+    # Result: [n_steps+1, n_samples, ...]
+    full_path = torch.cat(batch_paths, dim=1)
+    
+    return full_path
 
 # ============================================================================
 # Sample Generation
@@ -136,7 +164,8 @@ def generate_backward_samples(
     n_steps: int = 100, 
     device: str = 'cpu',
     solver: Callable = solve_backward_sde_euler_maruyama,
-    z_final_ground_truth: Tensor = None
+    z_final_ground_truth: Tensor = None,
+    batch_size: int = 64  # Batch size for SDE integration
 ) -> Dict[float, Tensor]:
     """
     Generate backward samples from the learned bridge, starting from the final time.
@@ -190,10 +219,10 @@ def generate_backward_samples(
 
         
         # Solve backward SDE from final time to 0
-        print(f"    Integrating backward SDE with {n_steps} steps using {solver.__name__}...")
+        print(f"    Integrating backward SDE with {n_steps} steps (batch_size={batch_size}) using {solver.__name__}...")
         try:
             backward_trajectory = solver(
-                bridge, z_final, ts=final_time, tf=0.0, n_steps=n_steps
+                bridge, z_final, ts=final_time, tf=0.0, n_steps=n_steps, batch_size=batch_size
             )
             
             trajectory_times = torch.linspace(final_time, 0.0, n_steps + 1)
@@ -229,11 +258,12 @@ def generate_backward_samples(
 def generate_comparative_backward_samples(
     bridge, 
     marginal_data: Dict[float, Tensor], 
-    n_samples: int = 64, 
+    n_samples: int = 4, 
     n_steps: int = 100, 
     device: str = 'cpu',
-    solver: Callable = solve_backward_sde_euler_maruyama
-) -> Tuple[Dict[float, Tensor], Dict[float, Tensor]]:
+    solver: Callable = solve_backward_sde_euler_maruyama,
+    batch_size: int = 64  # Batch size for SDE integration
+) -> Dict[float, Tensor]:
     """
     Generate backward samples starting from ground truth data at the final time.
     
@@ -276,7 +306,8 @@ def generate_comparative_backward_samples(
         n_steps=n_steps, 
         device=device,
         solver=solver,
-        z_final_ground_truth=ground_truth_final_subset
+        z_final_ground_truth=ground_truth_final_subset,
+        batch_size=batch_size
     )
     
     print("--- Backward Sample Generation Complete ---\n")

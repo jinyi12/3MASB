@@ -105,13 +105,15 @@ def radial_average(data_2d: Tensor) -> Tuple[Tensor, Tensor]:
 # Statistical Covariance Analysis Utilities
 # ============================================================================
 
-def compute_sample_covariance_matrix(samples: Tensor) -> Tensor:
+def compute_sample_covariance_matrix(samples: Tensor, truncate: bool = True, variance_threshold: float = 0.999) -> Tensor:
     """
-    Computes the full DxD sample covariance matrix for a batch of samples.
+    Computes the DxD sample covariance matrix for a batch of samples.
     Args:
         samples: Tensor of shape [N, D] (N samples, D dimensions).
+        truncate: Whether to truncate to retain specified variance fraction.
+        variance_threshold: Fraction of variance to retain if truncating.
     Returns:
-        Covariance matrix of shape [D, D].
+        Covariance matrix of shape [D, D] (possibly truncated).
     """
     N, D = samples.shape
     if N <= 1:
@@ -119,6 +121,8 @@ def compute_sample_covariance_matrix(samples: Tensor) -> Tensor:
         return torch.zeros(D, D, device=samples.device)
     try:
         covariance_matrix = torch.cov(samples.T)
+        if truncate:
+            covariance_matrix, _ = truncate_covariance_matrix(covariance_matrix, variance_threshold)
     except Exception as e:
         print(f"Warning: Covariance matrix computation failed: {e}")
         return torch.zeros(D, D, device=samples.device)
@@ -139,13 +143,15 @@ def relative_covariance_frobenius_distance(cov_target: Tensor, cov_gen: Tensor) 
     return (diff_norm / target_norm).item()
 
 
-def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
+def compute_sample_correlation_matrix(samples: Tensor, truncate: bool = True, variance_threshold: float = 0.999) -> Tensor:
     """
-    Computes the full DxD sample correlation matrix for a batch of samples.
+    Computes the DxD sample correlation matrix for a batch of samples.
     Args:
         samples: Tensor of shape [N, D] (N samples, D dimensions).
+        truncate: Whether to truncate to retain specified variance fraction.
+        variance_threshold: Fraction of variance to retain if truncating.
     Returns:
-        Correlation matrix of shape [D, D].
+        Correlation matrix of shape [D, D] (possibly truncated).
     """
     N, D = samples.shape
     if N <= 1:
@@ -163,10 +169,138 @@ def compute_sample_correlation_matrix(samples: Tensor) -> Tensor:
         correlation_matrix = cov_matrix * inv_std.unsqueeze(0) * inv_std.unsqueeze(1)
         # Clamp to valid correlation range
         correlation_matrix = torch.clamp(correlation_matrix, min=-1.0, max=1.0)
+        
+        if truncate:
+            correlation_matrix, _ = truncate_correlation_matrix(correlation_matrix, variance_threshold)
     except Exception as e:
         print(f"Warning: Correlation matrix computation failed: {e}")
         return torch.eye(D, device=samples.device)
     return correlation_matrix
+
+
+def truncate_covariance_matrix(cov_matrix: Tensor, variance_threshold: float = 0.999) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Truncates a covariance matrix to retain only components that contribute to
+    the specified fraction of total variance (default 99.9%).
+    
+    Args:
+        cov_matrix: Covariance matrix of shape [D, D]
+        variance_threshold: Fraction of variance to retain (default 0.999 for 99.9%)
+    
+    Returns:
+        Tuple of (truncated_cov_matrix, eigen_info) where eigen_info contains:
+            - 'eigenvalues': Full eigenvalue spectrum (descending order)
+            - 'eigenvectors': Full eigenvectors
+            - 'n_components': Number of components retained
+            - 'variance_ratio': Cumulative variance ratio
+    """
+    try:
+        # Eigendecomposition of covariance matrix
+        eigenvals, eigenvecs = torch.linalg.eigh(cov_matrix)
+        
+        # Sort eigenvalues and eigenvectors in descending order
+        sorted_indices = torch.argsort(eigenvals, descending=True)
+        eigenvals = eigenvals[sorted_indices]
+        eigenvecs = eigenvecs[:, sorted_indices]
+        
+        # Find number of components needed for desired variance
+        total_variance = torch.sum(eigenvals)
+        cumsum_variance = torch.cumsum(eigenvals, dim=0)
+        variance_ratio = cumsum_variance / total_variance
+        
+        # Find the smallest number of components that exceed threshold
+        n_components = torch.sum(variance_ratio < variance_threshold).item() + 1
+        n_components = min(n_components, len(eigenvals))  # Don't exceed matrix size
+        
+        # Reconstruct truncated covariance matrix
+        truncated_eigenvals = eigenvals[:n_components]
+        truncated_eigenvecs = eigenvecs[:, :n_components]
+        
+        # Cov = V * Lambda * V^T
+        truncated_cov = truncated_eigenvecs @ torch.diag(truncated_eigenvals) @ truncated_eigenvecs.T
+        
+        print(f"    Covariance truncated: {len(eigenvals)} -> {n_components} components (variance retained: {variance_ratio[n_components-1]:.4f})")
+        
+        # Return both the truncated matrix and full eigendecomposition info
+        eigen_info = {
+            'eigenvalues': eigenvals,
+            'eigenvectors': eigenvecs,
+            'n_components': n_components,
+            'variance_ratio': variance_ratio
+        }
+        
+        return truncated_cov, eigen_info
+        
+    except Exception as e:
+        print(f"Warning: Covariance truncation failed: {e}. Returning original matrix.")
+        # Return empty eigen_info on failure
+        return cov_matrix, {}
+
+
+def truncate_correlation_matrix(corr_matrix: Tensor, variance_threshold: float = 0.999) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Truncates a correlation matrix to retain only components that contribute to
+    the specified fraction of total variance (default 99.9%).
+    
+    Args:
+        corr_matrix: Correlation matrix of shape [D, D]
+        variance_threshold: Fraction of variance to retain (default 0.999 for 99.9%)
+    
+    Returns:
+        Tuple of (truncated_corr_matrix, eigen_info) where eigen_info contains:
+            - 'eigenvalues': Full eigenvalue spectrum (descending order)
+            - 'eigenvectors': Full eigenvectors
+            - 'n_components': Number of components retained
+            - 'variance_ratio': Cumulative variance ratio
+    """
+    try:
+        # Eigendecomposition of correlation matrix
+        eigenvals, eigenvecs = torch.linalg.eigh(corr_matrix)
+        
+        # Sort eigenvalues and eigenvectors in descending order
+        sorted_indices = torch.argsort(eigenvals, descending=True)
+        eigenvals = eigenvals[sorted_indices]
+        eigenvecs = eigenvecs[:, sorted_indices]
+        
+        # Find number of components needed for desired variance
+        total_variance = torch.sum(eigenvals)
+        cumsum_variance = torch.cumsum(eigenvals, dim=0)
+        variance_ratio = cumsum_variance / total_variance
+        
+        # Find the smallest number of components that exceed threshold
+        n_components = torch.sum(variance_ratio < variance_threshold).item() + 1
+        n_components = min(n_components, len(eigenvals))  # Don't exceed matrix size
+        
+        # Reconstruct truncated correlation matrix
+        truncated_eigenvals = eigenvals[:n_components]
+        truncated_eigenvecs = eigenvecs[:, :n_components]
+        
+        # Corr = V * Lambda * V^T
+        truncated_corr = truncated_eigenvecs @ torch.diag(truncated_eigenvals) @ truncated_eigenvecs.T
+        
+        # Ensure diagonal is exactly 1.0 for correlation matrix
+        diag_vals = torch.diag(truncated_corr)
+        truncated_corr = truncated_corr / torch.sqrt(diag_vals.unsqueeze(0) * diag_vals.unsqueeze(1))
+        
+        # Clamp to valid correlation range
+        truncated_corr = torch.clamp(truncated_corr, min=-1.0, max=1.0)
+        
+        print(f"    Correlation truncated: {len(eigenvals)} -> {n_components} components (variance retained: {variance_ratio[n_components-1]:.4f})")
+        
+        # Return both the truncated matrix and full eigendecomposition info
+        eigen_info = {
+            'eigenvalues': eigenvals,
+            'eigenvectors': eigenvecs,
+            'n_components': n_components,
+            'variance_ratio': variance_ratio
+        }
+        
+        return truncated_corr, eigen_info
+        
+    except Exception as e:
+        print(f"Warning: Correlation truncation failed: {e}. Returning original matrix.")
+        # Return empty eigen_info on failure
+        return corr_matrix, {}
 
 
 def relative_correlation_frobenius_distance(corr_target: Tensor, corr_gen: Tensor) -> float:
@@ -237,15 +371,16 @@ def calculate_validation_metrics(marginal_data: Dict[float, Tensor], generated_s
                 print(f"    Warning: MSE ACF calculation failed at t={t_val:.2f}: {e}")
         metrics['mse_acf'].append(mse_acf)
 
-        # 3. Full correlation comparison metrics (works for any D)
+        # 3. Truncated correlation comparison metrics (99.9% variance retained)
         try:
-            corr_data = compute_sample_correlation_matrix(target_data_cpu)
-            corr_gen = compute_sample_correlation_matrix(gen_data_cpu)
+            print("    Computing truncated correlation matrices (99.9% variance)...")
+            corr_data = compute_sample_correlation_matrix(target_data_cpu, truncate=True, variance_threshold=0.999)
+            corr_gen = compute_sample_correlation_matrix(gen_data_cpu, truncate=True, variance_threshold=0.999)
             rel_f = relative_correlation_frobenius_distance(corr_data, corr_gen)
             metrics['rel_fro_cov'].append(rel_f)  # Note: keeping same key for compatibility
 
         except Exception as e:
-            print(f"    Warning: Correlation metric calculation failed at t={t_val:.2f}: {e}")
+            print(f"    Warning: Truncated correlation metric calculation failed at t={t_val:.2f}: {e}")
             metrics['rel_fro_cov'].append(float('nan'))
         print(f"    t={t_val:.2f}: W2={w2_dist:.4f}, MSE_ACF={mse_acf:.4e}, RelF(Corr)={metrics['rel_fro_cov'][-1]:.4f}")
 
