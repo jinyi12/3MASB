@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from glow_layers_new import GatedConvNet
+from glow_layers import GatedConvNet
 
 # ============================================================================
 # Mask Creation Utilities
