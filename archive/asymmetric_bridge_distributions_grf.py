@@ -41,7 +41,6 @@ from scipy.stats import gaussian_kde
 # Import utilities for advanced visualization
 from utilities.visualization import (
     visualize_bridge_results as util_visualize_bridge_results,
-    _visualize_comparative_backward_samples,
 )
 from utilities.simulation import generate_comparative_backward_samples
 
