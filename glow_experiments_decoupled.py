@@ -70,30 +70,36 @@ class GLOWExperimentRunner:
         # Fixed experimental parameters for decoupled training
         self.fixed_params = {
             "grf": True,
-            "density_epochs": 500,
-            "dynamics_epochs": 500,
+            "density_epochs": 20,
+            "dynamics_epochs": 20,
             "hidden_size": 64,
             "density_lr": 1e-3,
             "dynamics_lr": 1e-3,
-            "resolution": 16,  # Standard GRF resolution
+            "resolution": 64,  # Standard GRF resolution
             "lambda_path": 0.0,  # Moderate path regularization
             "T": 1.0,  # Time horizon
             "n_ground_truth_trajectories": 1024,  # Total trajectories from ground truth simulation
             "n_blocks_flow": 2,  # Number of GLOW flow blocks
             "weight_decay": 1e-4,  # Weight decay for optimizer
             "grad_clip_norm": 1.0,  # Gradient clipping
-            "n_training_trajectories": 512,  # Subset used for training (formerly n_trajectories)
+            "n_training_trajectories": 128,  # Subset used for training (formerly n_trajectories), previous default 512
             "n_validation_trajectories": 1024,  # Dedicated trajectories for validation metrics
             "training_noise_std": 0.01,  # Enable variational dequantization (was 0.0)
             "sigma_reverse": 0.5,  # Reverse SDE noise level
             "covariance_type": "gaussian",  # Default GRF kernel type
+            # GRF-specific parameters
+            "l_domain": 1.0,  # GRF domain size
+            "h_max_factor": 0.5,  # GRF maximum filter factor
+            "mean_val": 10.0,  # GRF mean value
+            "std_val": 2.0,  # GRF standard deviation
             # Evaluation parameters (methodologically rigorous separation)
-            "n_viz_particles": 256,  # For visualization only (not used in validation)
+            "n_viz_particles": 32,  # For visualization only (not used in validation)
             "n_sde_steps": 100,      # SDE integration steps
             # Simple toggles (booleans only)
             "save_metrics": bool(save_metrics),
             "enable_covariance_analysis": bool(enable_covariance_analysis),
-            "validation_batch_size": 512,  # Batch size for validation (controls memory usage)
+            "validation_batch_size": 32,  # Batch size for validation (conservative for 64x64)
+            "training_batch_size": 32,  # Batch size for dynamics training (very conservative for 64x64)
         }
     
     def run_single_experiment(self, experiment_name: str, param_overrides: dict) -> dict:
@@ -241,15 +247,26 @@ class GLOWExperimentRunner:
         """
         Systematic analysis of GRF correlation length effects.
         Tests how micro_corr_length affects model performance and training dynamics.
+        Uses kernel-specific correlation lengths for focused experiments.
         """
         print("\n" + "="*80)
         print("CORRELATION LENGTH ANALYSIS")
         print("="*80)
         print("Testing GRF correlation length effects on GLOW bridge performance")
-        print("Fixed: Decoupled training, epochs=1000+1000, n_ground_truth_trajectories=1024")
+        print(f"Fixed: Decoupled training, epochs=1000+1000, kernel={self.fixed_params['covariance_type']}")
         
-        # Correlation lengths to test (logarithmic spacing for good coverage)
-        correlation_lengths = [0.05, 0.1, 0.2, 0.3, 0.5]
+        # Kernel-specific correlation lengths as requested
+        current_kernel = self.fixed_params.get("covariance_type", "gaussian")
+        if current_kernel == "exponential":
+            correlation_lengths = [0.05, 0.15]  # Exponential kernel correlation lengths
+            print("Exponential kernel: testing correlation lengths [0.05, 0.15]")
+        elif current_kernel == "gaussian":
+            correlation_lengths = [0.035, 0.045]  # Gaussian kernel correlation lengths
+            print("Gaussian kernel: testing correlation lengths [0.035, 0.045]")
+        else:
+            # Fallback for other kernels
+            correlation_lengths = [0.05, 0.1, 0.2, 0.3, 0.5]
+            print(f"Unknown kernel '{current_kernel}': using default correlation lengths")
         
         results = []
         # We'll collect per-timepoint metric arrays for aggregation
@@ -335,7 +352,8 @@ class GLOWExperimentRunner:
         print("Fixed: Decoupled training, epochs=1000+1000, corr_length=0.1, n_ground_truth_trajectories=1024")
         
         # Training trajectory counts to test (powers of 2 for systematic scaling)
-        training_trajectory_counts = [128, 256, 512, 1024]
+        # training_trajectory_counts = [128, 256, 512, 1024]
+        training_trajectory_counts = [128]
         
         results = []
         per_time_w2 = []
